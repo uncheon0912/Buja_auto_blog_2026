@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "부사연 슈퍼노바 SNS",
+  "version": "0.5.12",
+  "minimum_chrome_version": "116",
+  "description": "부자사람연구소에서 만든 SNS 글쓰기 도구입니다. AI로 글과 이미지를 만들고 블로그와 Threads 작성창에 넣을 수 있습니다.",
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "https://blog.naver.com/*",
+    "https://cafe.naver.com/*",
+    "https://*.tistory.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://threads.com/*",
+    "https://www.threads.com/*",
+    "https://threads.net/*",
+    "https://www.threads.net/*"
+  ],
+  "optional_host_permissions": [
+    "https://api.github.com/*",
+    "https://search.naver.com/*"
+  ],
+  "background": {
+    "service_worker": "2026-11-18-background.mjs",
+    "type": "module"
+  },
+  "icons": {
+    "16": "2026-11-19-buja-profile-icon-16.png",
+    "128": "2026-11-19-buja-profile-icon-128.png"
+  },
+  "action": {
+    "default_title": "부사연 슈퍼노바 SNS 열기",
+    "default_icon": {
+      "16": "2026-11-19-buja-profile-icon-16.png",
+      "20": "2026-11-19-buja-profile-icon-20.png",
+      "24": "2026-11-19-buja-profile-icon-24.png",
+      "32": "2026-11-19-buja-profile-icon-32.png",
+      "40": "2026-11-19-buja-profile-icon-40.png",
+      "48": "2026-11-19-buja-profile-icon-48.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "2026-11-18-panel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "2026-11-18-gemini.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://threads.com/*",
+        "https://www.threads.com/*",
+        "https://threads.net/*",
+        "https://www.threads.net/*"
+      ],
+      "js": [
+        "2026-11-19-threads.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+  }
+}
