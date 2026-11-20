@@ -23,9 +23,13 @@
     label{color:#d8d8db;font-weight:600;margin-top:12px}textarea,select{background:#242427;color:#fafafa;border-color:#55555a;font-weight:400;padding:10px}
     button{background:#303034;color:#eee;border-color:#505055;transition:background .15s,transform .15s}#draft,#insert,#yes,#images{background:#f4f4f5;color:#181818}
     button:hover:enabled{filter:brightness(1.15);transform:translateY(-1px)}button:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid #c4c6ff;outline-offset:2px}
+    section[data-folded]{min-height:0;padding:0;overflow:hidden}
+    section[data-folded] #grip{position:static;margin:0;padding:4px 8px;border-bottom:0}
+    section[data-folded] #mark{width:26px;height:26px}
+    section[data-folded] button{padding:4px 7px;margin:0}
     @media(prefers-reduced-motion:reduce){button{transition:none}button:hover:enabled{transform:none}}
-  </style><section><header id="grip"><span id="mark" aria-hidden="true">◎</span><strong>슈퍼노바 · Threads</strong><button id="dismiss" type="button" aria-label="패널 닫기" title="닫기">×</button></header><div id="offer">이 계정에 올릴 Threads 글을 준비할까요?<br><button id="yes">준비하기</button><button id="later">나중에</button></div>
-  <button id="resume" hidden>Threads 글 준비</button><div id="work" hidden><label>주제와 요청<textarea id="topic" rows="2"></textarea></label><label>이미지 개수<select id="count"></select></label><label id="ratioField" hidden>이미지 비율<select id="ratio"><option value="1:1">1:1</option><option value="4:5">4:5</option><option value="3:4">3:4 (인스타 카드뉴스)</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label><label id="styleField" hidden>이미지 스타일<select id="style"></select></label><button id="draft">게시글과 프롬프트 생성</button><label>게시할 글<textarea rows="4" id="post"></textarea></label><div id="prompts"></div><button id="images" hidden>이미지 생성</button><div id="gallery"></div><button id="insert">Threads 작성창에 넣기</button><button id="fold">접기</button></div><div id="status" role="status"></div></section>`;
+  </style><section><header id="grip"><span id="mark" aria-hidden="true">◎</span><strong>슈퍼노바 · Threads</strong><button id="resume" type="button" hidden>펼치기</button><button id="dismiss" type="button" aria-label="패널 닫기" title="닫기">×</button></header><div id="offer">이 계정에 올릴 Threads 글을 준비할까요?<br><button id="yes">준비하기</button><button id="later">나중에</button></div>
+  <div id="work" hidden><label>주제와 요청<textarea id="topic" rows="2"></textarea></label><label>이미지 개수<select id="count"></select></label><label id="ratioField" hidden>이미지 비율<select id="ratio"><option value="1:1">1:1</option><option value="4:5">4:5</option><option value="3:4">3:4 (인스타 카드뉴스)</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label><label id="styleField" hidden>이미지 스타일<select id="style"></select></label><button id="draft">게시글과 프롬프트 생성</button><label>게시할 글<textarea rows="4" id="post"></textarea></label><div id="prompts"></div><button id="images" hidden>이미지 생성</button><div id="gallery"></div><button id="insert">Threads 작성창에 넣기</button><button id="fold">접기</button></div><div id="status" role="status"></div></section>`;
   const el = id => ui.getElementById(id);
   const box=ui.querySelector('section');
   const grip=el('grip');
@@ -42,16 +46,18 @@
      if(scene){mark.firstChild.remove();scene.render(true);}
     }catch{}
   }
-  let anchored=false;
+  let anchored=false, expandedSize=null;
+  const handles=[];
   function place(x,y,w,h){
-    w=Math.min(innerWidth,Math.max(240,w));h=Math.min(innerHeight,Math.max(120,h));
+    const folded=box.hasAttribute('data-folded');
+    w=Math.min(innerWidth,Math.max(240,w));h=Math.min(innerHeight,folded ? h : Math.max(120,h));
     Object.assign(host.style,{left:Math.max(0,Math.min(innerWidth-w,x))+'px',top:Math.max(0,Math.min(innerHeight-h,y))+'px',right:'auto',bottom:'auto'});
-    Object.assign(box.style,{width:w+'px',height:h+'px',maxHeight:'none'});
+    Object.assign(box.style,{width:w+'px',height:folded ? '' : h+'px',maxHeight:'none'});
     anchored=true;
   }
   function drag(handle,corner){
     handle.onpointerdown=e=>{
-      if(e.button!==0)return;
+      if(e.button!==0 || e.target.closest('button'))return;
       e.preventDefault();handle.setPointerCapture(e.pointerId);
       const r=host.getBoundingClientRect(),sx=e.clientX,sy=e.clientY;
       handle.onpointermove=m=>{
@@ -68,7 +74,7 @@
   drag(grip,'');
   for(const corner of ['nw','ne','sw','se']){
     const h=document.createElement('span');h.style.cssText='position:absolute;width:16px;height:16px;z-index:2;touch-action:none;cursor:'+corner+'-resize;'+(corner[0]==='n'?'top':'bottom')+':0;'+(corner[1]==='w'?'left':'right')+':0';
-    ui.append(h);drag(h,corner);
+    ui.append(h);handles.push(h);drag(h,corner);
   }
   addEventListener('resize',()=>{if(anchored){const r=host.getBoundingClientRect();place(r.x,r.y,r.width,r.height);}});
   for(const name of ['아이폰 실사','애니메이션','치비','3D 글래스 스타일','텍스트','강렬한포스터'])el('style').add(new Option(name,name));
@@ -78,7 +84,8 @@
   const files=[];
   const sleep = ms => new Promise(resolve=>setTimeout(resolve,ms));
   const status = value => {el('status').textContent=value;};
-  let running=false;
+  let running=false, lastAttachment=null;
+  const mediaPreview = image => /^(blob:|data:image\/)/i.test(image.currentSrc || image.src);
   const prompts = () => [...el('prompts').querySelectorAll('textarea')];
   function action(id,fn){
     el(id).onclick=async()=>{
@@ -137,27 +144,73 @@
   });
   action('insert',async()=>{
     const post=el('post').value.trim();
-    if(!post || [...post].length>500)throw Error('게시글을 1~500자로 입력해주세요.');
+    if([...post].length<200 || [...post].length>300)throw Error('게시글을 공백 포함 200~300자로 입력해주세요.');
     if(files.length!==Number(el('count').value))throw Error('선택한 장수의 이미지를 먼저 생성해주세요.');
     if(!editor())createButton()?.click();
     for(let i=0;i<35&&!editor();i++)await sleep(100);
     const field=editor(),dialog=field?.closest('[role="dialog"]');
-    if(!field)throw Error('Threads에서 새 작성창을 연 뒤 다시 눌러주세요.');
-    if(field.innerText.trim() || dialog.querySelector('video,img[src^="blob:"],button[aria-label*="삭제"],button[aria-label*="Remove"]'))throw Error('작성 중인 내용이 있습니다. 빈 작성창을 열어주세요.');
-    const input=dialog.querySelector('input[type="file"][accept*="image"],input[type="file"][multiple]');
-    if(files.length && (!input || (files.length>1&&!input.multiple)))throw Error('작성창의 사진 첨부 입력란을 확인해주세요.');
-    field.focus();
-    document.execCommand('insertText',false,post);
+    if(!field || !dialog)throw Error('Threads에서 새 작성창을 연 뒤 다시 눌러주세요.');
     const normalize=s=>s.replace(/\s+/g,' ').trim();
-    if(normalize(field.innerText)!==normalize(post))throw Error('게시글 입력 결과를 확인해주세요.');
-    if(files.length){
-      const data=new DataTransfer();files.forEach(file=>data.items.add(file));
-      input.files=data.files;input.dispatchEvent(new Event('change',{bubbles:true}));
+    const previews=()=>[...dialog.querySelectorAll('img')].filter(img=>visible(img) && mediaPreview(img));
+    const pending=lastAttachment?.dialog===dialog && lastAttachment.post===post
+      && files.length===lastAttachment.files.length && files.every((file,i)=>file===lastAttachment.files[i]);
+    if (!pending) {
+      if(field.innerText.trim() || previews().length || dialog.querySelector('video'))throw Error('작성 중인 내용이 있습니다. 빈 작성창을 열어주세요.');
+      field.focus();
+      document.execCommand('insertText',false,post);
     }
-    status(files.length?'글을 입력하고 사진 첨부를 요청했습니다. 미리보기를 확인한 뒤 직접 게시하세요.':'글을 입력했습니다. 확인한 뒤 직접 게시하세요.');
+    if(normalize(field.innerText)!==normalize(post))throw Error('게시글 입력 결과를 확인해주세요.');
+    if(!files.length){status('글을 입력했습니다. 확인한 뒤 직접 게시하세요.');return;}
+
+    const previewCount=()=>{
+      const removeControls=[...dialog.querySelectorAll('button[aria-label],[role="button"][aria-label]')].filter(button=>
+        visible(button) && /^(?:사진|이미지|미디어)\s*(?:삭제|제거)|^(?:remove|delete)\s+(?:photo|image|media)/i.test(button.getAttribute('aria-label')));
+      return Math.max(previews().length,removeControls.length);
+    };
+    const count=previewCount();
+    if(count!==files.length){
+      if(count>0)throw Error('사진 '+count+'장을 확인했습니다. 작성창에서 첨부 상태를 확인해주세요.');
+      const data=new DataTransfer();
+      files.forEach(file=>data.items.add(file));
+      const input=[...dialog.querySelectorAll('input[type="file"]')].find(item=>
+        !item.disabled && /image|\.(?:png|jpe?g|webp)/i.test(item.accept) && (files.length===1 || item.multiple));
+      if(pending && lastAttachment.path==='paste')throw Error('글은 입력됐습니다. 사진 미리보기가 보이지 않으면 작성창의 사진 버튼으로 첨부해주세요.');
+      const useInput=input && !pending;
+      lastAttachment={dialog,post,files:[...files],path:useInput?'input':'paste'};
+      if(useInput){
+        input.files=data.files;
+        input.dispatchEvent(new Event('change',{bubbles:true}));
+      }else{
+        field.focus();
+        field.dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true,composed:true}));
+      }
+      for(let i=0;i<50 && previewCount()<files.length && dialog.isConnected;i++)await sleep(100);
+    }
+    if(!dialog.isConnected || previewCount()!==files.length){
+      throw Error('글은 입력됐습니다. 사진 '+previewCount()+'/'+files.length+'장이 확인됐습니다. 작성창의 미리보기를 확인해주세요.');
+    }
+    if(normalize(field.innerText)!==normalize(post))throw Error('사진 첨부 후 게시글 내용을 확인해주세요.');
+    status('글과 사진 '+files.length+'장을 입력했습니다. 확인한 뒤 직접 게시하세요.');
   });
-  function open(){el('offer').hidden=true;el('resume').hidden=true;el('work').hidden=false;}
-  function fold(){el('offer').hidden=true;el('work').hidden=true;el('resume').hidden=false;}
+  function open(){
+    el('offer').hidden=true;el('resume').hidden=true;el('work').hidden=false;
+    el('status').hidden=false;box.removeAttribute('data-folded');handles.forEach(handle=>handle.hidden=false);
+    if(expandedSize){
+      const r=host.getBoundingClientRect();
+      place(r.x,r.y,expandedSize.width,expandedSize.height);
+      expandedSize=null;
+    }
+  }
+  function fold(){
+    if(box.hasAttribute('data-folded'))return;
+    const r=host.getBoundingClientRect();
+    expandedSize={width:r.width,height:r.height};
+    el('offer').hidden=true;el('work').hidden=true;el('resume').hidden=false;el('status').hidden=true;
+    box.setAttribute('data-folded','');handles.forEach(handle=>handle.hidden=true);
+    Object.assign(box.style,{width:'min(300px, 100vw)',height:'',maxHeight:''});
+    const compact=host.getBoundingClientRect();
+    place(r.x,r.y,compact.width,compact.height);
+  }
   el('yes').onclick=open;el('resume').onclick=open;el('later').onclick=()=>{fold();void request({type:'THREAD_DISMISS'}).catch(()=>{});};el('fold').onclick=fold;
   function mount(){if(!closed && !host.isConnected && (createButton()||editor())){document.body.append(host);void decorate();}}
   request({type:'THREAD_PREF'}).then(hidden=>{if(hidden && !el('offer').hidden)fold();}).catch(()=>{});

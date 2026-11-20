@@ -3,6 +3,7 @@
  const isChatGPT=location.hostname==='chatgpt.com';
  let task=null;
  const reporting=new Set();
+ const acceptedRequests=new Set();
  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  const visible=el=>!!el&&el.getClientRects().length>0&&getComputedStyle(el).visibility!=='hidden';
  const normalizeComposer=value=>String(value||'').replace(/\s+/gu,' ').trim();
@@ -22,7 +23,9 @@
   return /^(?:1:1|4:5|3:4|4:3|9:16|16:9)\. 초안 단계에서는 실제 이미지를 생성하지 마세요\.$/.test(value.slice(offset));
  }
  function extensionImageRequest(value){
-  return /^(ChatGPT|Gemini) 이미지 생성으로 블로그에 사용할 완성 이미지 한 장을 생성해주세요\. 설명문 대신 실제 이미지 결과를 반환하세요\. \[이미지 목적\] 슬롯: /.test(value)
+  const legacy = /^(ChatGPT|Gemini) 이미지 생성으로 블로그에 사용할 완성 이미지 한 장을 생성해주세요\. 설명문 대신 실제 이미지 결과를 반환하세요\. \[이미지 목적\] 슬롯: /;
+  const current = /^ChatGPT 이미지 생성 요청입니다\. 지금 실제 완성 이미지 한 장을 생성하세요\. 설명문, 이미지 프롬프트, 작업 계획 대신 바로 생성한 이미지 자체를 응답에 첨부하세요\. \[이미지 목적\] 슬롯: /;
+  return (legacy.test(value) || current.test(value))
    && ['[이미지 유형]','[블로그 글 정보]','[제작 기준]','최종 캔버스:'].every(marker=>value.includes(marker))
    && value.endsWith('대상을 자르거나 늘리지 말고 구도를 다시 잡으세요.');
  }
@@ -53,6 +56,7 @@
   input.focus();
   if(input instanceof HTMLTextAreaElement){
    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,prompt);
+   input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt}));
   }else{
    const range=document.createRange();
    range.selectNodeContents(input);
@@ -61,7 +65,6 @@
    selection.addRange(range);
    if(!document.execCommand('insertText',false,prompt))return false;
   }
-  input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt}));
   return true;
  }
  function loginScreen(){
@@ -113,25 +116,19 @@
   }
   return (el?.querySelector('.markdown,.model-response-text')?.innerText || el?.innerText || '').trim();
  }
+ const userTurnSelector='[data-message-author-role="user"],[data-turn="user"],[data-testid="user-message"]';
+ const imageTurnSelector='[data-message-author-role="assistant"],[data-turn="assistant"],[data-testid^="conversation-turn"],[data-testid*="image-generation"],[data-testid*="generated-image"],[data-testid^="imagegen"]';
+ function chatImages(){
+  return [...document.querySelectorAll('main img,[role="main"] img')].filter(img=>{
+   if(img.closest(userTurnSelector+',form,nav,aside,[data-composer-surface],[data-type="unified-composer"]'))return false;
+   const wrapper=img.closest(imageTurnSelector);
+   if(wrapper && !wrapper.querySelector(userTurnSelector))return true;
+   return /^(?:generated image|image created|생성된 이미지|이미지 생성됨)(?:[:：\s]|$)/i.test(img.alt);
+  });
+ }
+ const imageURL=img=>img.currentSrc||img.src;
  const generating=()=>[...document.querySelectorAll('button[aria-label],button[data-testid],button[data-test-id]')].some(el=>visible(el)&&(el.dataset.testid==='stop-button'||/stop.*(response|generat)|응답.*중지|생성.*중지|stop-response/i.test(`${el.getAttribute('aria-label')} ${el.getAttribute('data-test-id')}`)));
  const sendButton=input=>[...(isChatGPT && composerScope(input) || document).querySelectorAll('button.send-button,button[aria-label],button[data-testid],button[data-test-id]')].find(el=>visible(el)&&!el.disabled&&(el.matches('button#composer-submit-button:not([data-testid=stop-button]),button[data-testid=send-button],button.send-button,button[data-test-id="send-button"]')||/^(send message|send|submit|메시지 보내기|보내기|프롬프트 (?:전송|보내기)|메시지 전송|전송)$/i.test((el.getAttribute('aria-label')||el.title||'').trim())));
- async function chooseImageTool(input,current){
-  const scope=composerScope(input) || input.closest('main,[role=main]') || input.parentElement.parentElement;
-  const label=el=>(el.getAttribute('aria-label') || el.innerText || '').trim();
-  const isImage=el=>/^(이미지\s*생성|이미지 만들기|create (?:an? )?image)(?:\s|$)/i.test(label(el));
-  if([...scope.querySelectorAll('button,[role=button]')].some(el=>visible(el)&&isImage(el)))return;
-  const nearby=input.getBoundingClientRect();
-  const buttons=[...document.querySelectorAll('button,[role=button]')].filter(el=>{const r=el.getBoundingClientRect();return scope.contains(el)||(Math.abs(r.bottom-nearby.bottom)<100 && Math.abs(r.right-nearby.left)<100);});
-  const plus=buttons.find(el=>visible(el)&&(el.matches('#composer-plus-btn,[data-testid=composer-plus-btn]') || (el.getAttribute('aria-haspopup')==='menu' && el.getBoundingClientRect().left<=nearby.left && !label(el)) || /파일.*추가|업로드|도구|사진 및 파일|add files|add photos|add files and more|open tools|^\+$/i.test(label(el))));
-  if(!plus)throw Error('ChatGPT 입력창에서 + 메뉴를 찾지 못했습니다.');
-  plus.click();
-  for(let i=0;i<40&&!current.cancelled;i++){
-   const option=[...document.querySelectorAll('[role=menuitem],[role=option],[role=menuitemradio],button')].find(el=>visible(el)&&isImage(el));
-   if(option){option.click();await sleep(300);return;}
-   await sleep(125);
-  }
-  throw Error('ChatGPT 메뉴에서 이미지 생성을 찾지 못했습니다.');
- }
  async function attach(attachments,current){
   if(!attachments?.length)return;
   let input=[...document.querySelectorAll('input[type="file"]')].find(el=>!el.disabled);
@@ -144,7 +141,7 @@
  async function collectImage(img){
   const url=img.currentSrc||img.src;
   if(url.startsWith('data:image/'))return {data:url};
-  if(url.startsWith('blob:') || (isChatGPT && new URL(url).protocol==='https:')){const r=await fetch(url,{credentials:new URL(url).origin===location.origin?'same-origin':'omit'});if(!r.ok)throw Error('이미지를 읽을 수 없습니다.');const b=await r.blob();if(b.size>8*1024*1024)throw Error('생성 이미지가 8MB를 넘습니다.');const data=await new Promise((resolve,reject)=>{const fr=new FileReader();fr.onload=()=>resolve(fr.result);fr.onerror=()=>reject(Error('이미지 읽기 실패'));fr.readAsDataURL(b);});return {data};}
+  if(url.startsWith('blob:') || (isChatGPT && new URL(url).protocol==='https:')){const r=await fetch(url,{credentials:new URL(url).origin===location.origin?'same-origin':'omit',signal:AbortSignal.timeout(15000)});if(!r.ok)throw Error('이미지를 읽을 수 없습니다.');const b=await r.blob();if(b.size>8*1024*1024)throw Error('생성 이미지가 8MB를 넘습니다.');const data=await new Promise((resolve,reject)=>{const fr=new FileReader();fr.onload=()=>resolve(fr.result);fr.onerror=()=>reject(Error('이미지 읽기 실패'));fr.readAsDataURL(b);});return {data};}
   return {url};
  }
  async function run(job,attachments,current){
@@ -184,9 +181,9 @@
    if(previous&&!canReplace){await blocked(input);return;}
    reportStage('composer-ready');
    const baseline=new Map(responses().map(x=>[x,responseText(x,job.kind)]));
-   const oldImages=new Set(responses().flatMap(el=>[...el.querySelectorAll('img')].map(x=>x.currentSrc||x.src)));
+   const oldImages=new Set((isChatGPT ? chatImages() : responses().flatMap(el=>[...el.querySelectorAll('img')])).map(imageURL));
+   const previousUserTurns=isChatGPT ? new Set(document.querySelectorAll(userTurnSelector)) : new Set();
    await attach(attachments,current);if(current.cancelled)return;
-   if(isChatGPT && job.kind==='image'){await chooseImageTool(input,current);if(current.cancelled)return;}
    input=editor();
    if(!input || normalizeComposer(inputText(input))!==previous){await blocked(input);return;}
    if(!insertPrompt(input,job.prompt))throw Error('Gemini 요청 입력에 실패했습니다. 프롬프트 복사를 사용해주세요.');
@@ -221,7 +218,7 @@
     attributes: true, attributeFilter: ['src','srcset','aria-label','aria-busy']
    });
    const began=Date.now(),limit=job.kind==='image'?300000:180000;let last='',stable=0,collecting=false,lastRead=0,fullText='',fullNode;
-   let observedChars=0,sawReply=false;
+   let observedChars=0,sawReply=false,sawImageCard=false;
    while(Date.now()-began<limit&&!current.cancelled){
     await waitForResponseChange();if(current.cancelled)return;const latest=responses().at(-1);let content=responseText(latest,job.kind);
     if(isChatGPT && job.kind==='article' && latest && !baseline.has(latest)){
@@ -233,8 +230,13 @@
     }
     const alert=[...document.querySelectorAll('[role=alert]')].filter(visible).map(node=>node.innerText).join(' ');
     if(/usage limit|reached your .*limit|too many requests|rate limit|사용량.{0,12}(초과|한도)|한도에 도달/i.test(alert+' '+(latest&&!baseline.has(latest)?content:'')))throw Error('사용량 제한입니다. 다른 AI를 선택해 이어가세요.');
-    const imgs=latest?[...latest.querySelectorAll('img')].filter(img=>visible(img)&&img.complete&&img.naturalWidth>=128&&!oldImages.has(img.currentSrc||img.src)):[];
-    const fresh=latest&&(!baseline.has(latest)||baseline.get(latest)!==content||imgs.length>0);
+    const userTurn=isChatGPT && job.kind==='image' ? [...document.querySelectorAll(userTurnSelector)].findLast(node=>!previousUserTurns.has(node)) : null;
+    const candidates=job.kind==='image' && isChatGPT ? chatImages().filter(img=>!userTurn || !!(userTurn.compareDocumentPosition(img)&4))
+     : latest ? [...latest.querySelectorAll('img')] : [];
+    const unseen=candidates.filter(img=>imageURL(img)&&!oldImages.has(imageURL(img)));
+    sawImageCard ||= unseen.length>0;
+    const imgs=unseen.filter(img=>visible(img)&&img.complete&&img.naturalWidth>=128&&img.naturalHeight>=128);
+    const fresh=job.kind==='image' ? imgs.length>0 : latest&&(!baseline.has(latest)||baseline.get(latest)!==content);
     const signature=job.kind==='image'?imgs.map(x=>x.currentSrc||x.src).join('|'):content;
     if (job.kind === 'article' && !collecting && fresh && signature) {
      collecting = true;
@@ -242,10 +244,17 @@
     }
     if(!fresh||!signature||(generating() && !(isChatGPT && job.kind==='article' && signature))){stable=0;last=signature;continue;}
     if(signature!==last||!stable){last=signature;stable=Date.now();continue;}
-    if(Date.now()-stable>=2800&&Date.now()-began>=5000){if(job.kind==='image')await report({images:[await collectImage(imgs[0])]});else{if(content.length>60000)throw Error('생성 응답이 너무 깁니다.');await report({text:content});}return;}
+    if(Date.now()-stable>=2800&&Date.now()-began>=5000){if(job.kind==='image'){
+     try{await report({images:[await collectImage(imgs.at(-1))]});}
+     catch(e){await report({error:'생성 이미지를 찾았지만 파일을 가져오지 못했습니다. '+e.message,code:'IMAGE_FILE_READ_FAILED'});}
+    }else{if(content.length>60000)throw Error('생성 응답이 너무 깁니다.');await report({text:content});}return;}
    }
    if(!current.cancelled && isChatGPT && job.kind==='article'){
     await report({error:'ChatGPT 초안을 수집하지 못했습니다. '+(sawReply?'응답은 발견했지만 완전한 초안 JSON을 확인하지 못했습니다.':'새 답변 영역을 찾지 못했습니다.'),responseProbe:{sawReply,observedChars}});return;
+   }
+   if(!current.cancelled && job.kind==='image' && isChatGPT){
+    await report({error:sawImageCard?'ChatGPT 이미지 카드가 보였지만 완성 파일을 확인하지 못했습니다.':'ChatGPT의 이번 응답에서 이미지 카드를 찾지 못했습니다.',code:sawImageCard?'IMAGE_CARD_INCOMPLETE':'IMAGE_CARD_MISSING'});
+    return;
    }
    if(!current.cancelled)throw Error(job.kind==='image'?'5분 안에 생성 이미지를 수집하지 못했습니다. Gemini에서 내려받은 파일을 갤러리에 직접 추가해주세요.':'3분 안에 초안을 수집하지 못했습니다. Gemini 응답을 직접 붙여넣어주세요.');
   }catch(e){if(!current.cancelled)await report({error:isChatGPT?e.message.replaceAll('Gemini','ChatGPT'):e.message});}finally{observer?.disconnect();if(task===current)task=null;}
@@ -265,8 +274,10 @@
   }
   if(msg.type==='BUJA_CANCEL'){if(task?.id===msg.jobId)task.cancelled=true;reply({ok:true});return;}
   if(msg.type==='BUJA_START'){
-   if(task&&!task.cancelled){reply({ok:false,error:'이 Gemini 탭에서 이미 수집 중입니다.'});return;}
    if(!msg.job?.id||typeof msg.job.prompt!=='string'||msg.job.prompt.length>90000){reply({ok:false,error:'요청 형식이 잘못되었습니다.'});return;}
+   if(acceptedRequests.has(msg.job.id)){reply({ok:true});return;}
+   if(task&&!task.cancelled){reply({ok:false,error:'이 Gemini 탭에서 이미 수집 중입니다.'});return;}
+   acceptedRequests.add(msg.job.id);
    const current={id:msg.job.id,cancelled:false};task=current;reply({ok:true});void run(msg.job,msg.attachments,current);
   }
  });

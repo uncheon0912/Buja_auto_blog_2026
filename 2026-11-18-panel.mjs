@@ -1,4 +1,4 @@
-import {VERSION,busy,choices,formOf,draftOf,parseDraft,htmlOf,articlePrompt,imagePrompt,backupOf,imageTypeRatios} from './2026-11-18-core.mjs';
+import {VERSION,DEFAULT_ACCENT,busy,choices,formOf,draftOf,parseDraft,htmlOf,articlePrompt,imagePrompt,backupOf,imageTypeRatios,seriesNames} from './2026-11-18-core.mjs';
 import {getBlob,getData} from './2026-11-18-assets.mjs';
 import { blocksOf, fixedPhotoPosition, imageAnchor, photoPlacements, textOfBlock } from './2026-11-18-document.mjs';
 import { connectionKey, transferKey, platformNames } from './2026-11-18-platforms.mjs';
@@ -95,7 +95,11 @@ function renderBlockFields() {
     fields.append(group);
   }
 }
-function sourceView(){$('searchBox').hidden=$('source').value==='direct';}
+function sourceView(){
+ const articleOnly = $('useArticleReference').checked;
+ for (const id of ['source','topic','audience','keywords','notes']) $(id).disabled = articleOnly;
+ $('searchBox').hidden = articleOnly || $('source').value === 'direct';
+}
 function renderPreview() {
   if (!state) return;
   const draft = getDraft();
@@ -171,7 +175,7 @@ function renderDraftProgress() {
   }
 }
 
-function renderJob(){renderDraftProgress();const running=pending||draftProgress?.status==='connecting'||busy(state?.job)||transferring;for(const id of ['generate','revise','generateImages','applyManual','draftTitle','draftBody','summary','hashtags','photoFiles','referenceFile','import','clearImages','clearDraft'])$(id).disabled=!!running;for(const e of document.querySelectorAll('#gallery button,#gallery input,#gallery textarea'))e.disabled=!!running;
+function renderJob(){renderDraftProgress();const running=pending||draftProgress?.status==='connecting'||busy(state?.job)||transferring;for(const id of ['generate','revise','generateImages','applyManual','draftTitle','draftBody','summary','hashtags','photoFiles','referenceFile','import','clearImages','clearDraft','loadTestDraft'])$(id).disabled=!!running;for(const e of document.querySelectorAll('#gallery button,#gallery input,#gallery textarea'))e.disabled=!!running;
  for(const field of document.querySelectorAll('#blockFields textarea,#gallery select')) field.disabled=running||transferring;
  const imageJob=state?.job?.kind==='image';
  $('stopImages').hidden=!imageJob || !busy(state.job);
@@ -182,11 +186,14 @@ function renderJob(){renderDraftProgress();const running=pending||draftProgress?
  $('cancel').hidden=!busy(state?.job);const j=state?.job;
  $('jobState').textContent=j?.status==='running'?`${j.kind==='image'?'이미지 응답을 기다립니다.':'초안 진행 단계는 상단에서 확인할 수 있습니다.'}${state.imageQueue.length?` 남은 이미지 ${state.imageQueue.length}장.`:''}`:pending||j?.status==='preparing'?'AI 탭을 준비하고 입력창을 확인하는 중입니다.':j?.status==='error'?j.error:j?.status==='cancelled'?'수집을 중단했습니다. AI 자체 생성은 해당 화면에서 중지할 수 있습니다.':j?.status==='done'?'결과를 가져왔습니다. 내용을 확인해주세요.':'주제와 조건을 입력하면 시작할 수 있습니다.';
  $('referenceName').textContent=state?.reference?`참고 사진: ${state.reference.name}`:'선택된 참고 사진 없음';
- const seriesStyle = state?.draft?.imageSeriesStyle;
- for(const radio of radios){radio.checked=radio.value===(seriesStyle || $('imageType').value);radio.disabled=Boolean(running || seriesStyle)}
+ const customPrompt = $('preferImagePrompt').checked;
+ $('preferImagePrompt').disabled = !!running;
+ const storedStyle = state?.draft?.imageSeriesStyle;
+ const seriesStyle = seriesNames.includes(storedStyle) ? storedStyle : '';
+ for(const radio of radios){radio.checked=radio.value===(seriesStyle || $('imageType').value);radio.disabled=Boolean(running || seriesStyle || customPrompt)}
  $('generateImages').textContent=state?.job?.kind==='image' && busy(state.job) ? `이미지 생성 중 · ${state.job.photoIndex}/${state.job.batchCount}장`:'이미지 생성';
- $('imageType').disabled = !!running || !!seriesStyle;
- $('imageSeriesStyle').textContent = seriesStyle ? `이 글의 이미지 스타일 · ${seriesStyle}` : '선택한 스타일을 이 글의 모든 생성 이미지에 적용합니다.';
+ $('imageType').disabled = !!running || !!seriesStyle || customPrompt;
+ $('imageSeriesStyle').textContent = customPrompt ? '사용자 프롬프트 우선 적용' : seriesStyle ? `이 글의 이미지 스타일 · ${seriesStyle}` : '선택한 스타일을 이 글의 모든 생성 이미지에 적용합니다.';
 }
 function renderConnection() {
   const connection = state?.connection;
@@ -221,12 +228,16 @@ function renderTransfer(photoCount = state?.images.filter(image => image.draftId
   button.textContent = running ? '연결된 글쓰기창으로 전송 중…' : '④ 연결된 글쓰기창에 넣기';
   $('retryTransfer').hidden = !connected || progress?.status !== 'retryable';
   $('retryTransfer').disabled = running || generating || !$('placementWarning').hidden;
+  const failed = connected && ['review','retryable','blocked'].includes(progress?.status);
+  $('restartTransfer').hidden = !failed;
+  $('restartTransfer').disabled = running || generating || !draftReady || !$('placementWarning').hidden;
   $('viewTransfer').hidden = !connected || !hasResult;
   let status = '보낼 내용은 제목과 본문' + (photoCount ? ', 사진 ' + photoCount + '장' : '') + '입니다.';
   if (connected && (running || hasResult || progress?.status === 'blocked')) status = progress?.message || '입력 결과를 확인하고 있습니다.';
   else if (generating) status = '진행 중인 생성이 끝나면 전송할 수 있습니다.';
   else if (!connected) status = '① 현재 탭 연결에서 글쓰기창을 지정하세요.';
   else if (!draftReady) status = '제목과 본문을 작성하면 전송할 수 있습니다.';
+  if (failed && !running) status += '\n오른쪽 편집기에서 본문과 삽입된 사진을 지운 뒤 ‘본문 비운 뒤 다시 입력’을 눌러주세요.';
   if ($('transferStatus').textContent !== status) $('transferStatus').textContent = status;
 }
 const time=s=>new Intl.DateTimeFormat('ko-KR',{dateStyle:'short',timeStyle:'short',timeZone:'Asia/Seoul'}).format(new Date(s));
@@ -256,6 +267,7 @@ async function sync(fill=false){const next=await api('STATE');const {job}=await 
 function persist(){if(!state)return Promise.resolve();const revision=editRevision,form=getForm(),draft=busy(state.job)||pending?null:getDraft();const next=saves.catch(()=>{}).then(()=>api('SAVE',{form,...(draft?{draft}:{})}));saves=next;return next.then(()=>{savedRevision=Math.max(revision,savedRevision);$('saveState').textContent='현재 입력과 초안을 자동 저장했습니다.';},e=>{$('saveState').textContent='저장 실패: '+e.message;throw e;});}
 async function flush(){clearTimeout(timer);await persist();}
 function changedDraft(){editRevision++;sourceView();renderPreview();clearTimeout(timer);$('saveState').textContent='저장 중…';timer=setTimeout(()=>act(persist),450);}
+$('preferImagePrompt').addEventListener('input',renderJob);
 for(const id of [...keys,'draftTitle','draftBody','summary','hashtags'])$(id).addEventListener('input',changedDraft);
 async function renderGallery(){
  const epoch=++galleryEpoch;
@@ -356,7 +368,28 @@ async function renderGallery(){
  };
  button('프롬프트 복사',copyPrompt,image.prompt?.trim()?quick:row);
  button('이미지 내려받기',async()=>download(await getBlob(image.id),`2026-11-18-${image.name.replace(/[^\p{L}\p{N}_.-]/gu,'_')}`));
- button('AI로 수정',async()=>{const request=window.prompt('사진을 어떻게 수정할까요? 원본은 보존하고 새 이미지를 추가합니다.');if(!request?.trim())return;await save();await api('REGENERATE_IMAGE',{id:image.id,request});await sync();});
+ if(image.draftId===state.draft.id) button('이 이미지만 다시 생성',async()=>{
+  const request=window.prompt('바꾸고 싶은 부분이 있으면 입력하세요. 비워 두면 같은 조건으로 다시 생성합니다.');
+  if(request===null)return;
+  await save();
+  await api('REGENERATE_IMAGE',{id:image.id,request:request.trim()});
+  await sync();
+ },quick);
+ const replacement = state.job?.item?.replaceId===image.id ? state.job.replacement : null;
+ if(replacement){
+  try{
+   const blob=await getBlob(replacement.id);
+   if(epoch!==galleryEpoch)return;
+   const previewURL=URL.createObjectURL(blob);
+   urls.push(previewURL);
+   const preview=document.createElement('img');
+   preview.src=previewURL;preview.alt='교체 후보 이미지';
+   const controls=document.createElement('div');controls.className='row';
+   button('새 이미지로 교체',async()=>{await api('APPLY_IMAGE_REPLACEMENT',{id:image.id});await sync();},controls);
+   button('원본 유지',async()=>{await api('DISCARD_IMAGE_REPLACEMENT',{id:image.id});await sync();},controls);
+   content.append(preview,controls);
+  }catch{notice('교체 후보 이미지를 미리 볼 수 없습니다.',true);}
+ }
  if(image.draftId!==state.draft.id)button('현재 초안에 사용',()=>save(true));
  const remove=button('제거',async()=>{if(!confirm('갤러리에서 제거할까요? History에서 원본을 복원할 수 있습니다.'))return;await api('REMOVE_IMAGE',{id:image.id});await sync();});
  remove.className='danger';details.append(row);content.append(quick,details);card.append(img,content);gallery.append(card);
@@ -419,15 +452,43 @@ click('recoverComposer',async()=>{
 });
 click('stopImages',async()=>{await api('CANCEL');await sync();});
 click('resumeImages',async()=>{await flush();await api('RESUME_IMAGES');await sync();});
+click('loadTestDraft',async()=>{
+ if(pending || transferring || busy(state?.job) || state?.transfer?.status==='running')return;
+ const saved=flush();
+ pending=true;
+ renderJob();
+ try{
+  await saved;
+  await api('LOAD_TEST_DRAFT');
+  draftProgress=undefined;
+  await sync(true);
+  notice('테스트용 초안과 썸네일 1장을 불러왔습니다. 연결된 빈 글쓰기창에 전송해 확인하세요.');
+ }finally{
+  pending=false;
+  renderJob();
+  renderConnection();
+ }
+});
 click('savePrefs',async()=>{await flush();await api('SAVE_PREFS',{form:getForm()});notice('이 Chrome 프로필에 현재 설정을 저장했습니다.');});
 click('generateImages',async()=>{await flush();await api('GENERATE_IMAGES');await sync();notice('최신 초안으로 이미지 생성을 시작했습니다.');});
 click('cancel',async()=>{await api('CANCEL');await sync();notice('수집을 중단했습니다. AI 생성 자체는 해당 화면에서 중지해주세요.');});
+click('publishedReset',async()=>{
+ if(!confirm('이 글을 발행하셨나요? 현재 초안과 갤러리를 비웁니다.'))return;
+ await flush();await api('PUBLISHED_RESET',{draftId:state.draft.id});await sync(true);notice('새 글을 작성할 준비가 됐습니다.');
+});
 click('clearDraft',async()=>{
  if(!confirm('현재 초안의 제목·본문·태그와 전송 기록을 지울까요? 이미지 갤러리와 이미 입력한 네이버 글은 보존됩니다.'))return;
  await flush();await api('CLEAR_DRAFT',{draftId:state.draft.id});$('revision').value='';$('draftEditor').hidden=true;await sync(true);notice('기존 초안을 지웠습니다.');
 });
 click('editDraft',()=>{$('draftEditor').hidden=!$('draftEditor').hidden;});click('closeEdit',async()=>{await flush();$('draftEditor').hidden=true;await renderGallery();notice('초안 수정을 저장했습니다.');});
-click('resetAccent',()=>{$('accent').value='#08796b';renderPreview();void act(flush);});
+click('clearArticleReference', async () => {
+ for (const id of ['articleTitle','articleBody','articleSource']) $(id).value = '';
+ $('useArticleReference').checked = false;
+ changedDraft();
+ await flush();
+ notice('기사 제목·본문·출처를 초기화했습니다.');
+});
+click('resetAccent',()=>{$('accent').value=DEFAULT_ACCENT;renderPreview();void act(flush);});
 click('save',async()=>{await flush();await api('SNAPSHOT');await sync();notice('현재 초안과 사진을 History에 보관했습니다.');});
 async function copy(s){await navigator.clipboard.writeText(s);notice('클립보드에 복사했습니다.');}
 function copyableDraft() {
@@ -453,15 +514,16 @@ click('copyHTML',async()=>{
 });
 click('copyPrompt',()=>copy(articlePrompt(getForm(),$('revision').value?getDraft():null,$('revision').value,state.images.filter(x=>x.source==='upload'))));
 click('applyManual',async()=>{parseDraft($('manual').value);await flush();await api('APPLY_MANUAL',{text:$('manual').value});await sync(true);notice('붙여넣은 응답을 적용했습니다.');});
-async function transfer(retry=false) {
-  if (transferring || $(retry ? 'retryTransfer' : 'transfer').disabled) return;
+async function transfer(mode='TRANSFER') {
+  const button = {TRANSFER:'transfer',RETRY_TRANSFER:'retryTransfer',RESTART_TRANSFER:'restartTransfer'}[mode];
+  if (transferring || $(button).disabled) return;
   transferring = true;
   renderJob();
   renderTransfer();
   try {
     await flush();
-    if (!retry) await api('SNAPSHOT');
-    const result = await api(retry ? 'RETRY_TRANSFER' : 'TRANSFER',{includeDiffText:$('includeDiffText').checked});
+    if (mode !== 'RETRY_TRANSFER') await api('SNAPSHOT');
+    const result = await api(mode,{includeDiffText:$('includeDiffText').checked});
     notice(result.message, result.status !== 'done');
   } finally {
     transferring = false;
@@ -469,7 +531,8 @@ async function transfer(retry=false) {
   }
 }
 click('transfer',()=>transfer());
-click('retryTransfer',()=>transfer(true));
+click('retryTransfer',()=>transfer('RETRY_TRANSFER'));
+click('restartTransfer',()=>transfer('RESTART_TRANSFER'));
 click('viewTransfer',()=>api('FOCUS_CONNECTED'));
 click('clearImages',async()=>{if(!confirm('갤러리를 비울까요? 현재 작업을 History에 보관합니다.'))return;await api('CLEAR_IMAGES');await sync();});
 click('openSearch',async()=>{await flush();await api('OPEN_SEARCH');});
@@ -526,7 +589,7 @@ chrome.storage.onChanged.addListener((changes,area)=>{
   if (generated || changedDraft) fillDraft(state.draft);
   renderJob();
   renderConnection();
-  if (changes.images || generated || changedDraft) {
+  if (changes.images || changes.job?.oldValue?.replacement || job?.replacement || generated || changedDraft) {
     renderPreview();
     void act(renderGallery);
   }

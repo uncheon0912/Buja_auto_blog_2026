@@ -51,7 +51,11 @@ export function normalizeContent(raw) {
     while (used.has(id)) id = '_' + id;
     used.add(id);
     if (['list', 'ordered-list', 'checklist'].includes(type)) {
-      return [{ id, type, text: plain(value.text, 250), items: listItems(value.items) }];
+      const items = listItems(value.items);
+      if (type === 'ordered-list' && items.some(item => item.children.length)) {
+        for (const item of items) item.text = item.text.replace(/^\s*\d+[.)]\s+/, '');
+      }
+      return [{ id, type, text: plain(value.text, 250), items }];
     }
     if (type === 'faq') {
       const items = Array.isArray(value.items) ? value.items.slice(0, 16).map(item => ({
@@ -79,6 +83,42 @@ export function textOfBlock(block) {
 }
 
 export function blocksOf(draft) {
+  const blocks=unmarkedBlocks(draft);
+  const last = blocks.at(-1);
+  if (last?.type === 'paragraph' && /[?？]$/.test(last.text.trim())) {
+    const parts = last.text.trim().match(/^([\s\S]+[.!?。])\s+([^.!?。？]+[?？])$/u);
+    if (parts) {
+      let id = last.id + '-closing';
+      while (blocks.some(block => block.id === id)) id += '_';
+      blocks.splice(-1, 1, {...last,id,text:parts[1]}, {...last,text:parts[2].trim()});
+    }
+  }
+  const closing = blocks.at(-1);
+  if (closing?.type === 'paragraph' && /[?？]$/.test(closing.text.trim())) {
+    blocks[blocks.length - 1] = {...closing, closingQuestion:true};
+  }
+  const keywords=(draft.hashtags||[]).map(t=>t.replace(/^#/,'')).filter(Boolean);
+  const choices=[];
+  for(const block of blocks){
+    if(block.type!=='paragraph'||block.closingQuestion||block.id.startsWith('editorial-'))continue;
+    const words=[...block.text.matchAll(/[^\s.!?。]+/gu)];
+    const spans=[];
+    for(let i=0;i<words.length;i++){
+      for(let j=i;j<words.length;j++){
+        const start=words[i].index,end=words[j].index+words[j][0].length;
+        const phrase=block.text.slice(start,end),length=Array.from(phrase).length;
+        if(length>15)break;
+        if(length>=10)spans.push({block,start,end,score:keywords.filter(k=>phrase.includes(k)).length});
+      }
+    }
+    spans.sort((a,b)=>b.score-a.score);
+    if(spans.length)choices.push(spans[0]);
+  }
+  choices.sort((a,b)=>b.score-a.score);
+  const marks=new Map(choices.slice(0,5).map((span,i)=>[span.block,{...span,kind:['yellow','underline','mint','underline','yellow'][i]}]));
+  return blocks.map(block=>marks.has(block)?{...block,mark:marks.get(block)}:block);
+}
+function unmarkedBlocks(draft) {
   if (draft.content?.length) {
     const ids = new Set(draft.content.map(block => block.id));
     return draft.content.flatMap(block => {
@@ -141,27 +181,41 @@ function listHTML(items, tag, checklist = false) {
     + (item.children?.length ? listHTML(item.children, 'ul') : '') + '</li>').join('') + '</' + tag + '>';
 }
 
-export function renderBlock(block, accent, article = false, headingColor = false) {
+export function renderBlock(block, accent, article = false, naver = false, preview = false) {
   if(block.id?.startsWith('editorial-divider-') && block.text==='---')return '<hr>';
-  const content = htmlText(block.text || '');
+  let content = htmlText(block.text || '');
+  if(block.mark){
+    const {start,end,kind}=block.mark;
+    const phrase=htmlText(block.text.slice(start,end));
+    const highlighted=kind==='underline'?(naver ? '<u>'+phrase+'</u>' : '<strong><u>'+phrase+'</u></strong>'):'<span style="background-color:'+(kind==='mint'?'#b8f2de':'#fff1a8')+'">'+phrase+'</span>';
+    content=htmlText(block.text.slice(0,start))+highlighted+htmlText(block.text.slice(end));
+  }
+  const base = 'font-size:16px;font-weight:400;text-decoration:none;color:' + (preview ? 'inherit' : '#222222');
+  const bodyText = html => '<span style="' + base + '">' + html + '</span>';
+  const paragraph = html => '<p style="' + base + '">' + bodyText(html) + '</p>';
   const accented = 'border-left:4px solid ' + accent
     + (article ? ';background-color:' + accent + '14;padding:10px 12px;border-radius:8px' : ';padding-left:10px');
   const label = article && content ? '<p><strong>' + content + '</strong></p>' : '';
   switch (block.type) {
     case 'heading': {
-      const colored = headingColor ? '<span style="color:' + accent + ';font-weight:700">' + content + '</span>' : content;
-      return '<h' + block.level + ' style="' + accented + (headingColor ? ';color:' + accent : '')
-        + '">' + colored + '</h' + block.level + '>';
+      if (!naver) return '<h2 style="font-size:24px;font-weight:700;color:'+accent+'">'+content+'</h2>';
+      return '<p style="font-size:24px;font-weight:700"><strong><span style="font-size:24px;font-weight:700;color:'+accent+'">'+content+'</span></strong></p>';
     }
     case 'blockquote': return '<blockquote>' + content + '</blockquote>';
     case 'callout': return '<p style="' + accented + '">'
       + (block.title ? '<strong>' + htmlText(block.title) + '</strong><br>' : '<strong>' + content + '</strong>')
       + (block.title ? content : '') + '</p>';
     case 'list': case 'checklist': return label + listHTML(block.items, 'ul', article && block.type === 'checklist');
-    case 'ordered-list': return label + listHTML(block.items, 'ol');
+    case 'ordered-list':
+      if (block.items.some(item => item.children?.length)) {
+        return label + block.items.map(item => paragraph('<strong><u>' + htmlText(item.text) + '</u></strong>')
+          + (item.children?.length ? '<div style="' + base + '">' + listHTML(item.children,'ul') + '</div>' : '')
+          + '<p><br></p>').join('');
+      }
+      return label + listHTML(block.items, 'ol');
     case 'faq': return (article && content ? '<h2 style="' + accented + '">' + content + '</h2>' : '')
       + block.items.map(item => '<p><strong>Q. ' + htmlText(item.question)
       + '</strong><br>A. ' + htmlText(item.answer) + '</p>').join('');
-    default: return '<p>' + content + '</p>';
+    default: return (block.closingQuestion ? '<p><br></p>' : '') + paragraph(content);
   }
 }

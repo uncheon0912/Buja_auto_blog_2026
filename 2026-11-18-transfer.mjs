@@ -1,3 +1,4 @@
+import { DEFAULT_ACCENT } from './2026-11-18-core.mjs';
 import { blocksOf, photoPlacements, renderBlock, textOfBlock } from './2026-11-18-document.mjs';
 import { getData } from './2026-11-18-assets.mjs';
 import { connectionKey, transferKey, platformNames, platformOf } from './2026-11-18-platforms.mjs';
@@ -151,26 +152,46 @@ function boundary(block, last) {
 }
 
 export function buildTransferPlan(draft, form, photos, platform) {
-  const blocks = blocksOf(draft).filter(block => textOfBlock(block).trim());
+  const sourceBlocks = blocksOf(draft).filter(block => textOfBlock(block).trim());
+  const divider = block => block.type==='paragraph' && /^-{3,}$/.test(block.text.trim());
+  const blocks = sourceBlocks.filter(block => !divider(block));
   const naver = platform === 'naver';
-  const tagCandidates = [...(draft.hashtags || []), ...(form.keywords || '').split(/[,\n]+/)];
+  const tagCandidates = [...(draft.hashtags || []), ...(form.useArticleReference ? '' : form.keywords || '').split(/[,\n]+/)];
   const tags = naver ? [...new Set(tagCandidates.map(tag =>
     tag.normalize('NFC').replace(/[^\p{L}\p{N}_]/gu, '')).filter(Boolean))].slice(0, 8) : [];
   const tagLine = tags.map(tag => '#' + tag).join(' ');
   const tagBlock = tagLine ? { type: 'paragraph', text: tagLine } : null;
+  const related = naver ? {id:'related-reading',type:'heading',text:'함께 읽으면 좋은글'} : null;
   const indexes = new Map(blocks.map((block, index) => [block.id, index]));
   indexes.set('', -1);
-  const placed = photoPlacements(photos, blocks, platform).map(image => {
+  let textOffset = 0;
+  const offsets = platform === 'tistory' ? blocks.map(block => {
+    textOffset += textOfBlock(block).normalize('NFC').replace(/[\s\u200b-\u200d\ufeff\u00ad\u2022\u2060]/gu,'').length;
+    return textOffset;
+  }) : [];
+  const placed = photoPlacements(photos, sourceBlocks, platform).map(image => {
+    const sourceIndex = sourceBlocks.findIndex(block=>block.id===image.anchor);
+    if (sourceIndex >= 0 && divider(sourceBlocks[sourceIndex])) {
+      const previous = sourceBlocks.slice(0,sourceIndex).findLast(block=>!divider(block));
+      image = {...image,anchor:previous?.id ?? ''};
+    }
     if (image.anchor === undefined) throw Error('사진 위치가 바뀌었습니다. 갤러리에서 새 위치를 지정해주세요.');
     const index = indexes.get(image.anchor);
+    if (platform === 'tistory') return {...image, textOffset: offsets[index] ?? 0};
     return naver ? image : { ...image, left: boundary(blocks[index], true), right: boundary(blocks[index + 1] || tagBlock, false) };
   });
   const title = draft.title?.trim();
   if (!title || !blocks.length) throw Error('제목과 본문을 먼저 작성해주세요.');
-  const accent = /^#[0-9a-f]{6}$/i.test(form.accent) ? form.accent : '#08796b';
-  const steps = [...blocks, ...(tagBlock ? [tagBlock] : [])].map(block => ({
-    text: textOfBlock(block), html: naver && block.id?.startsWith('editorial-divider-') && block.text==='---' ? '<p>---</p>' : renderBlock(block, accent, false, naver), format: boundary(block, true)
-  }));
+  const accent = /^#[0-9a-f]{6}$/i.test(form.accent) ? form.accent : DEFAULT_ACCENT;
+  const steps = [...blocks, ...(tagBlock ? [tagBlock] : []), ...(related ? [related] : [])].map((block,index,list) => {
+    const html = renderBlock(block, block === related ? '#e66a00' : accent, false, platform !== 'tistory');
+    return {
+      text: textOfBlock(block),
+      html: naver && block.type === 'heading' && block !== related ? html + '<p><br></p>' : html,
+      format: boundary(block,true),
+      freshBody: naver && list[index-1]?.type === 'heading'
+    };
+  });
   const sequence = [];
   const images = [];
   function addPhoto(photo) {
@@ -183,11 +204,11 @@ export function buildTransferPlan(draft, form, photos, platform) {
       sequence.push({textIndex: index});
       placed.filter(photo => photo.anchor === block.id).forEach(addPhoto);
     }
-    if (tagBlock) sequence.push({textIndex: blocks.length});
+    for (let i=blocks.length;i<steps.length;i++) sequence.push({textIndex:i});
   } else {
     placed.forEach(addPhoto);
   }
-  return { title, plainText: steps.map(step => step.text).join('\n'), html: steps.map(step => step.html).join(''),
+  return { title, plainText: steps.map(step => step.text).join(platform === 'tistory' ? '\n\n' : '\n'), html: steps.map(step => step.html).join(''),
     blocks: blocks.map(block => boundary(block, true)), images, steps, sequence, accent, tagCount:tags.length };
 }
 
@@ -222,19 +243,19 @@ function confirmedStep(plan, progress, cursor, result) {
   };
 }
 
-export async function sendDraft(windowId, state, retry = false, report = async () => {}, includeDiffText = false) {
+export async function sendDraft(windowId, state, retry = false, report = async () => {}, includeDiffText = false, restart = false) {
   if (activeTransfers.has(windowId)) throw Error('이 창에서 이미 전송 중입니다.');
   activeTransfers.add(windowId);
   try {
-    return await runTransfer(windowId, state, retry, report, includeDiffText);
+    return await runTransfer(windowId, state, retry, report, includeDiffText, restart);
   } finally {
     activeTransfers.delete(windowId);
   }
 }
 
-async function runTransfer(windowId, { draft, form, images }, retry, report, includeDiffText) {
-  const previous = retry ? await transferFor(windowId) : null;
-  const id = previous?.id || crypto.randomUUID();
+async function runTransfer(windowId, { draft, form, images }, retry, report, includeDiffText, restart) {
+  const previous = retry || restart ? await transferFor(windowId) : null;
+  const id = retry && previous?.id || crypto.randomUUID();
   const record = (event, details) => report(event,{operationId:id, retry, ...details}).catch(()=>{});
   await record('전송 연결 확인 시작',{stage:'probe-editor',source:'transfer.getConnected'});
   let connection;
@@ -263,7 +284,12 @@ async function runTransfer(windowId, { draft, form, images }, retry, report, inc
   }
   const fingerprint = await hash(plan);
   const key = transferKey(windowId);
-  if (!retry && probe.occupied) {
+  if (restart && (!['review','retryable','blocked'].includes(previous?.status) || previous.draftId !== draft.id
+    || previous.documentId !== connection.documentId)) throw Error('해당 초안의 중단된 글쓰기창에서 다시 입력을 사용해주세요.');
+  if (restart && (probe.bodyOccupied || (probe.title && probe.title !== plan.title.replace(/\s+/g,' ').trim()))) {
+    throw Error('오른쪽 편집기에서 본문과 삽입된 사진을 지운 뒤 다시 눌러주세요. 제목이 초안과 다르면 제목도 지워주세요.');
+  }
+  if (!retry && !restart && probe.occupied) {
     await record('전송 계획 확인 실패',{...target,stage:'plan',source:'transfer.runTransfer',code:'EDITOR_OCCUPIED'});
     throw Error('편집기에 기존 글·사진이 있습니다. 새 빈 글쓰기창에 연결해주세요.');
   }
@@ -296,10 +322,14 @@ async function runTransfer(windowId, { draft, form, images }, retry, report, inc
   let failedStage = 'read-photos';
   let stepContext = {};
   try {
-    // Read all original attachments before making any change to the editor.
+    const tistory = connection.platform === 'tistory';
     const files = new Map();
-    for (const photo of plan.images.slice(progress.completed)) files.set(photo.id, await getData(photo.id));
-    await record('전송용 사진 읽기 완료',{...target,stage:'read-photos',source:'assets.getData',readPhotos:files.size});
+    async function readPhotos() {
+      failedStage = 'read-photos';
+      for (const photo of plan.images.slice(progress.completed)) files.set(photo.id, await getData(photo.id));
+      await record('전송용 사진 읽기 완료',{...target,stage:'read-photos',source:'assets.getData',readPhotos:files.size});
+    }
+    if (!tistory) await readPhotos();
     if (probe.sharedInput) {
       failedStage = 'activate-editor';
       await chrome.tabs.update(connection.tabId, { active: true });
@@ -309,21 +339,22 @@ async function runTransfer(windowId, { draft, form, images }, retry, report, inc
       }
     }
     if (!retry) {
-      failedStage = 'title';
-      await record('제목 입력 시작',{...target,stage:failedStage,source:'editor.editorBridge'});
+      failedStage = tistory ? 'title-body' : 'title';
+      await record(tistory ? '티스토리 제목·본문 입력 시작' : '제목 입력 시작',{...target,stage:failedStage,source:'editor.editorBridge'});
       const result = await invoke(connection, 'begin', {
         transferId: progress.id, title: plan.title, html: plan.html, plainText: plan.plainText,
-        blocks: plan.blocks, accent: plan.accent, hasPhotos: !!photos.length
+        blocks: plan.blocks, accent: plan.accent, hasPhotos: !!photos.length, restart
       });
       if (result.status !== 'ok') {
-        await record('제목 입력 실패',{...target,stage:failedStage,code:'EDITOR_BEGIN_FAILED',source:'editor.editorBridge',status:result.status});
+        await record(tistory ? '티스토리 제목·본문 입력 실패' : '제목 입력 실패',{...target,stage:failedStage,code:'EDITOR_BEGIN_FAILED',source:'editor.editorBridge',status:result.status});
         await update({ status: result.status, message: result.message });
         return progress;
       }
       await update({ titleDone: true, bodyDone: connection.platform !== 'naver',
         textDone: connection.platform === 'naver' ? 0 : plan.steps.length, formatWarnings: result.formatWarnings || [] });
-      await record('제목 입력 검증 완료',{...target,stage:failedStage,code:'TITLE_VERIFIED',source:'editor.editorBridge'});
+      await record(tistory ? '티스토리 제목·본문 입력 검증 완료' : '제목 입력 검증 완료',{...target,stage:failedStage,code:'TITLE_VERIFIED',source:'editor.editorBridge'});
     }
+    if (tistory) await readPhotos();
     for (let cursor = progress.cursor; cursor < plan.sequence.length; cursor++) {
       const {textIndex, photoIndex} = plan.sequence[cursor];
       const base = {transferId: progress.id, cursor, accent: plan.accent, includeDiffText};
@@ -341,18 +372,29 @@ async function runTransfer(windowId, { draft, form, images }, retry, report, inc
       const started = performance.now();
       failedStage = textIndex !== undefined ? 'append' : 'photo';
       if (textIndex !== undefined) {
-        result = await invoke(connection, 'append', {...base, step: plan.steps[textIndex]});
+        const append = () => invoke(connection, 'append', {...base, step:plan.steps[textIndex]});
+        result = await append();
+        for (let attempt=1;attempt<=3;attempt++) {
+          if (result.status !== 'retryable' || result.diagnostic?.writeAttempted !== false
+            || !['BODY_TAIL_UNAVAILABLE','BODY_EMPTY_TARGET_UNVERIFIED'].includes(result.diagnostic.code)) break;
+          const resume = await checkResume(connection, progress);
+          if (resume?.cursor !== cursor) break;
+          await record('본문 입력 위치 자동 재확인',{...target,...stepContext,stage:'retry-body-target',
+            code:result.diagnostic.code,attempt,source:'transfer.runTransfer'});
+          await new Promise(resolve=>setTimeout(resolve,250*attempt));
+          result = await append();
+        }
       } else {
         const photo = plan.images[photoIndex];
         result = await invoke(connection, 'photo', {
           ...base, index: photoIndex, anchor: photo.left, following: photo.right,
-          tail: connection.platform === 'naver', image: {name: photo.name, data: files.get(photo.id)}
+          tail: connection.platform === 'naver', textOffset: photo.textOffset, image: {name: photo.name, data: files.get(photo.id)}
         });
       }
       if (result.status !== 'ok') {
         await record('입력 구역 검증 실패',{...target,...stepContext,stage:failedStage,code:'EDITOR_STEP_FAILED',
           source:'editor.editorBridge',status:result.status, elapsedMs:Math.round(performance.now() - started), ...result.diagnostic});
-        await update({pendingPhoto:result.diagnostic?.code==='PHOTO_NOT_CONFIRMED',status: result.status, message: progressMessage(progress, `${label}에서 중단됐습니다. ${result.message}`)});
+        await update({pendingPhoto:result.diagnostic?.code==='PHOTO_NOT_CONFIRMED',status: result.status, message: progressMessage(progress, `${label}에서 중단됐습니다. ${result.message}${tistory && progress.bodyDone ? ` 제목과 본문은 입력됐습니다. 미첨부 사진은 ${progress.total - progress.completed}장입니다.` : ''}`)});
         return progress;
       }
       await update({...confirmedStep(plan, progress, cursor, result),pendingPhoto:false});

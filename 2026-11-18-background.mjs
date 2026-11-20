@@ -62,7 +62,6 @@ async function start(job,attachments=[]){
  const provider=providerName(job);
  const {composerDigests={},imageComposerDigests=[]}=await chrome.storage.local.get(['composerDigests','imageComposerDigests']);
  const knownComposerDigests=[...(composerDigests[provider]||[]),...(provider==='ChatGPT'?imageComposerDigests:[])];
- if(provider==='ChatGPT')job={...job,prompt:job.prompt.replace(/^Gemini 이미지 생성/,'ChatGPT 이미지 생성')};
  await change({job});
  try{const r=await chrome.tabs.sendMessage(job.tabId,{type:'BUJA_START',job:{...job,knownComposerDigests},attachments},{frameId:0});if(!r?.ok)throw Error(r?.error||providerName(job)+'에서 요청을 받지 못했습니다.');}
  catch(e){
@@ -116,7 +115,7 @@ async function beginArticle(msg,s){
   const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s.job.prompt.replace(/\s+/gu,' ').trim()));
   await rememberComposer(form.textAI,Array.from(new Uint8Array(bytes),n=>n.toString(16).padStart(2,'0')).join(''));
  }
- const attachments=[];if(form.mode==='photo'){if(photos.reduce((n,p)=>n+p.size,0)>20*1024*1024)throw Error('AI에 첨부할 사진 전체 용량을 20MB 이하로 줄여주세요.');for(const p of photos)attachments.push({name:p.name,data:await getData(p.id)});}
+ const attachments=[];if(form.mode==='photo' && !form.useArticleReference){if(photos.reduce((n,p)=>n+p.size,0)>20*1024*1024)throw Error('AI에 첨부할 사진 전체 용량을 20MB 이하로 줄여주세요.');for(const p of photos)attachments.push({name:p.name,data:await getData(p.id)});}
  let job = {id:crypto.randomUUID(), kind:'article', provider:form.textAI,length:form.length,status:'preparing', stage:'connecting', started:now(), prompt,...(recovery?{replaceComposerDigest:recovery.blockedComposerDigest}:{})};
  await change({job, form, imageQueue:[]});
  await generationTrace(job,providerName(job)+' 초안 연결 시작','connect',{promptLength:prompt.length,attachmentCount:attachments.length});
@@ -157,7 +156,8 @@ async function occupiedComposer(tabId,provider,kind="article"){
 async function beginImages(items) {
  const batchId = crypto.randomUUID();
  const {draft,form} = await read();
- const visualStyle = imageSeriesStyle(form,draft);
+ if(form.preferImagePrompt && !form.imageNotes.trim())throw Error('우선 반영할 이미지 프롬프트를 입력해주세요.');
+ const visualStyle = form.preferImagePrompt ? '' : imageSeriesStyle(form,draft);
  await trace(form.imageAI+' 이미지 배치 시작',{operationId:batchId,kind:'image',stage:'connect',source:'background.beginImages',expectedPhotos:items.length});
  let tab;
  try {
@@ -168,7 +168,7 @@ async function beginImages(items) {
    await releaseGeminiTab(tab.id);
    tab=await openGeminiWindow(form.imageAI);
   }
-  await change({remainingImages:{draftId:draft.id,items},aiTabId:tab.id,imageQueue:items.map((item,index)=>({...item,provider:form.imageAI,visualStyle,batchId,photoIndex:index + 1,batchCount:items.length}))});
+  await change({remainingImages:{draftId:draft.id,items},aiTabId:tab.id,imageQueue:items.map((item,index)=>({...item,provider:form.imageAI,visualStyle,customPrompt:form.preferImagePrompt ? form.imageNotes : null,batchId,photoIndex:index + 1,batchCount:items.length}))});
   await nextImage();
  } catch (error) {
   await trace(form.imageAI+' 이미지 배치 요청 실패',{operationId:batchId,kind:'image',stage:'request',source:'background.beginImages',code:error.code || 'IMAGE_REQUEST_FAILED'});
@@ -185,7 +185,7 @@ async function nextImage(){
  await waitGemini(tabId,provider);
  const {windowId}=await chrome.tabs.get(tabId);
  const attachments=s.form.referenceRequired&&s.reference?[{name:s.reference.name,data:await getData(s.reference.id)}]:[];
- const job={id:crypto.randomUUID(),kind:'image',status:'running',provider,tabId,windowId,started:now(),draftId:s.draft.id,item,prompt:imagePrompt(s.form,{...s.draft,imageSeriesStyle:item.visualStyle},item),
+ const job={id:crypto.randomUUID(),kind:'image',status:'running',provider,tabId,windowId,started:now(),draftId:s.draft.id,item,prompt:imagePrompt({...s.form,imageAI:provider,preferImagePrompt:item.customPrompt!=null,imageNotes:item.customPrompt??s.form.imageNotes},{...s.draft,imageSeriesStyle:item.visualStyle},item),
   batchId:item.batchId,photoIndex:item.photoIndex,batchCount:item.batchCount};
  await change({imageQueue:remaining});await start(job,attachments);
  await generationTrace(job,providerName(job)+' 이미지 요청 전달','request',{promptLength:job.prompt.length,attachmentCount:attachments.length,thumbnail:!!item.thumbnail});
@@ -245,7 +245,7 @@ async function result(msg,sender){
    let output;
    if(job.kind==='article'){
     const raw=JSON.parse(msg.text.trim().replace(/^```(?:json)?\s*|\s*```$/gi,''));
-    if(typeof raw.text!=='string'||!raw.text.trim()||Array.from(raw.text).length>500 || !Array.isArray(raw.image_prompts)||raw.image_prompts.length!==job.count||raw.image_prompts.some(p=>typeof p!=='string'||!p.trim()))throw Error('게시글 또는 이미지 프롬프트 수를 확인해주세요.');
+    if(typeof raw.text!=='string'||!raw.text.trim()||[...raw.text.trim()].length<200||[...raw.text.trim()].length>300 || !Array.isArray(raw.image_prompts)||raw.image_prompts.length!==job.count||raw.image_prompts.some(p=>typeof p!=='string'||!p.trim()))throw Error('게시글은 공백 포함 200~300자로 작성해야 합니다. 이미지 프롬프트 개수도 확인해주세요.');
     output={text:raw.text.trim(),prompts:raw.image_prompts};
    }else{
     const id=crypto.randomUUID();await putAsset(id,await imageData(msg.images[0]));output={imageId:id};
@@ -262,11 +262,6 @@ async function result(msg,sender){
    await generationTrace(job,providerName(job)+' 초안 응답 수신','parse',{responseLength:text(msg.text).length});
    const parsed=parseDraft(msg.text);
    const notes=reviewArticle(parsed,s.form);
-   if(notes.length && !job.revisions){
-     await start({...job,id:crypto.randomUUID(),started:now(),stage:'request',revisions:1,
-       prompt:articlePrompt(s.form,parsed,'다음 항목만 보완한 완성 JSON 전체를 반환하세요. '+notes.join(' / ').slice(0,4000))});
-     return {};
-   }
    const draft=layoutArticle({...parsed,reviewNotes:notes});
    const images = s.images.map(x=>x.source==='upload'&&x.draftId===s.draft.id?{...x,draftId:draft.id}:x);
    await snapshot('생성 전 초안',s);
@@ -283,17 +278,23 @@ async function result(msg,sender){
  }
  let imageStage = 'collect';
  try{
-  if(msg.error)throw Error(text(msg.error,1200));
+  if(msg.error)throw Object.assign(Error(text(msg.error,1200)),{code:msg.code});
    if(s.draft.id!==job.draftId)throw Error('초안이 바뀌어 이미지 결과를 적용하지 않았습니다.');
    const candidate=msg.images?.[0];if(!candidate)throw Error('생성된 이미지 파일을 찾지 못했습니다. Gemini에서 내려받은 사진을 직접 선택해주세요.');
    await generationTrace(job,providerName(job)+' 이미지 응답 수신','collect',{observedPhotos:msg.images.length});
    const id=crypto.randomUUID();
    const original=await imageData(candidate);
-   const overlayText = imageOverlayText(job.item.overlayText) || (job.item.thumbnail ? thumbnailOverlayText(s.draft) : '');
-   const visualStyle = imageSeriesStyle(s.form,{...s.draft,imageSeriesStyle:job.item.visualStyle});
+   const overlayText = job.item.thumbnail ? imageOverlayText(job.item.overlayText,20) || thumbnailOverlayText(s.draft) : imageOverlayText(job.item.overlayText);
+   const visualStyle = job.item.customPrompt!=null ? s.draft.imageSeriesStyle : imageSeriesStyle(s.form,{...s.draft,imageSeriesStyle:job.item.visualStyle});
    imageStage = 'save-image';
    const info=await putAsset(id,original);
-   const image={id,...info,name:`2026-11-19-gemini-${s.images.length+1}.${info.mime==='image/jpeg'?'jpg':info.mime==='image/webp'?'webp':'png'}`,source:'gemini',draftId:job.draftId,prompt:job.item.prompt,caption:job.item.label,alt:job.item.alt||'',visualStyle,afterBlockId:job.item.afterBlockId||'',afterParagraph:job.item.afterParagraph,...placementOf(job.item.placement),thumbnail:!!job.item.thumbnail,...(overlayText?{overlayText,overlaySource:'gemini'}:{}),at:now()};
+   const image={id,...info,name:`2026-11-19-gemini-${s.images.length+1}.${info.mime==='image/jpeg'?'jpg':info.mime==='image/webp'?'webp':'png'}`,source:'gemini',draftId:job.draftId,prompt:job.item.prompt,page:job.item.page,pages:job.item.pages,sectionText:job.item.sectionText,caption:job.item.label,alt:job.item.alt||'',visualStyle,afterBlockId:job.item.afterBlockId||'',afterParagraph:job.item.afterParagraph,...placementOf(job.item.placement),thumbnail:!!job.item.thumbnail,...(overlayText?{overlayText,overlaySource:'gemini'}:{}),at:now()};
+   if(job.item.replaceId){
+    await change({remainingImages:null,job:{...job,status:'done',ended:now(),replacement:image}});
+    await generationTrace(job,providerName(job)+' 교체 이미지 검토 준비','saved',{bytes:info.size,mime:info.mime,thumbnail:image.thumbnail});
+    await closeFinishedGemini(job);
+    return {};
+   }
    await snapshot('이미지 추가 전',s);await change({remainingImages:s.imageQueue.length?{draftId:s.draft.id,items:s.imageQueue}:null,draft:{...s.draft,imageSeriesStyle:visualStyle},images:newGeneratedImages(s.images,image),job:{...job,status:'done',ended:now()}});
    await generationTrace(job,providerName(job)+' 원본 이미지 저장 완료','saved',{bytes:info.size,mime:info.mime,thumbnail:image.thumbnail,overlayRequested:!!overlayText,visualStyle});
    await snapshot('이미지 생성 결과');
@@ -341,7 +342,7 @@ async function command(msg,sender){
   if(!['article','image'].includes(kind)||!Number.isInteger(count)||count<0||count>10||!text(msg.prompt,4000).trim())throw Error('주제와 이미지 개수를 확인해주세요.');
   const style=seriesNames.includes(msg.style)?msg.style:seriesNames[0];
   const direction=seriesDirection(style,text(msg.seriesSeed,100));
-  const prompt=kind==='article'?`Threads 한국어 게시글 한 개를 450자 이내 자연스러운 대화체와 짧은 단락으로 작성하세요. 경험이나 수치를 꾸미지 마세요. JSON 코드블록 하나로 {"text":"게시글","image_prompts":[]}를 반환하세요. 서로 다른 장면의 독립적인 이미지 프롬프트를 정확히 ${count}개 넣으세요. 0이면 빈 배열입니다. 스타일: ${direction}. 주제 및 요청: ${text(msg.prompt,4000)}`:`실제 이미지 한 장을 생성하세요. 설명 대신 이미지로 응답하세요. 글 자료: ${text(msg.post,500)}. 장면 소재: ${text(msg.prompt,4000)}. 최우선 제작 스타일: ${style}. ${direction}. 텍스트 또는 포스터 스타일이면 본문의 핵심 한글 문구를 정돈된 제목으로 직접 표현하세요.`;
+  const prompt=kind==='article'?`Threads 한국어 게시글 한 개를 공백 포함 200~300자로 자연스러운 대화체와 짧은 단락으로 작성하세요. 경험이나 수치를 꾸미지 마세요. JSON 코드블록 하나로 {"text":"게시글","image_prompts":[]}를 반환하세요. 서로 다른 장면의 독립적인 이미지 프롬프트를 정확히 ${count}개 넣으세요. 0이면 빈 배열입니다. 스타일: ${direction}. 주제 및 요청: ${text(msg.prompt,4000)}`:`실제 이미지 한 장을 생성하세요. 설명 대신 이미지로 응답하세요. 글 자료: ${text(msg.post,500)}. 장면 소재: ${text(msg.prompt,4000)}. 최우선 제작 스타일: ${style}. ${direction}. 텍스트 또는 포스터 스타일이면 본문의 핵심 한글 문구를 정돈된 제목으로 직접 표현하세요.`;
   const index=Number(msg.index)||0;
   let tab;
   if(kind==='image' && index>0){
@@ -392,9 +393,14 @@ async function command(msg,sender){
  }
  case 'FOCUS_CONNECTED':await focusConnected(msg.windowId);return {};
  case 'TRANSFER':
- case 'RETRY_TRANSFER':{
+ case 'RETRY_TRANSFER':
+ case 'RESTART_TRANSFER':{
   if(busy(s.job))throw Error('생성 중에는 전송할 수 없습니다.');
-  const result = await sendDraft(msg.windowId, s, msg.type === 'RETRY_TRANSFER', trace, msg.includeDiffText === true);
+  const result = await sendDraft(msg.windowId, s, msg.type === 'RETRY_TRANSFER', trace, msg.includeDiffText === true, msg.type === 'RESTART_TRANSFER');
+  if(result.status==='done'){
+    const connection=await connectionFor(msg.windowId);
+    if(connection?.platform==='naver')await chrome.storage.session.set({['publish:'+msg.windowId]:{tabId:connection.tabId,draftId:s.draft.id,title:s.draft.title}});
+  }
   await log(result.status === 'done' ? '전송 완료' : '전송 확인 필요', result.message);
   return result;
  }
@@ -402,14 +408,29 @@ async function command(msg,sender){
  case 'GENERATE_IMAGES':{
   if(busy(s.job))throw Error('진행 중인 생성을 기다려주세요.');if(!s.draft.title||!s.draft.body)throw Error('초안을 먼저 준비해주세요.');if(s.form.referenceRequired&&!s.reference)throw Error('필수 참고 이미지를 선택해주세요.');
   const current=s.images.filter(x=>x.draftId===s.draft.id).length,count=s.form.imageCount||Math.max(1,Math.min(3,s.draft.imagePrompts.length||2));if(current+count>10)throw Error('현재 초안 사진은 최대 10장입니다. 기존 사진을 정리하거나 생성 개수를 줄여주세요.');
-  await beginImages(planImageBatch(s.draft,current+count).slice(current));return {};
+  const plan=planImageBatch(s.draft,current+count);
+  const hasCover=s.images.some(image=>image.draftId===s.draft.id && image.thumbnail);
+  await beginImages(current && !hasCover ? [plan[0],...plan.slice(current+1)] : plan.slice(current));return {};
  }
  case 'REGENERATE_IMAGE':{
   if(busy(s.job))throw Error('진행 중인 생성을 기다려주세요.');const x=s.images.find(x=>x.id===msg.id);if(!x)throw Error('사진이 없습니다.');if(s.form.referenceRequired&&!s.reference)throw Error('필수 참고 이미지를 선택해주세요.');
-  if(s.images.filter(x=>x.draftId===s.draft.id).length>=10)throw Error('새 이미지는 원본을 보존하며 추가됩니다. 사진을 먼저 9장 이하로 줄여주세요.');
+  if(x.draftId!==s.draft.id)throw Error('현재 초안에 있는 사진을 선택해주세요.');
   const connection = await connectionFor(msg.windowId);
   const thumbnail = currentCover(s,connection?.platform || 'naver')?.id === x.id;
-  await beginImages([{label:thumbnail?'블로그 썸네일':x.caption||'수정 이미지',prompt:`${x.prompt}\n수정 요청: ${text(msg.request,3000)}`,alt:x.alt,afterBlockId:thumbnail?'':x.afterBlockId,afterParagraph:thumbnail?0:x.afterParagraph,...placementOf(x.placement),thumbnail,overlayText:thumbnail ? imageOverlayText(x.overlayText,20) || thumbnailOverlayText(s.draft) : (imageOverlayText(x.overlayText).length >= 10 ? imageOverlayText(x.overlayText) : planImageBatch({...s.draft,imagePrompts:[null,{...x,label:x.caption}]},2)[1].overlayText)}]);
+  await beginImages([{label:thumbnail?'블로그 썸네일':x.caption||'수정 이미지',prompt:x.prompt,revision:text(msg.request,3000),replaceId:x.id,page:x.page,pages:x.pages,sectionText:x.sectionText,alt:x.alt,afterBlockId:thumbnail?'':x.afterBlockId,afterParagraph:thumbnail?0:x.afterParagraph,...placementOf(x.placement),thumbnail,overlayText:thumbnail ? imageOverlayText(x.overlayText,20) || thumbnailOverlayText(s.draft) : (imageOverlayText(x.overlayText).length >= 10 ? imageOverlayText(x.overlayText) : planImageBatch({...s.draft,imagePrompts:[null,{...x,label:x.caption}]},2)[1].overlayText)}]);
+  return {};
+ }
+ case 'APPLY_IMAGE_REPLACEMENT':
+ case 'DISCARD_IMAGE_REPLACEMENT':{
+  const {job}=s;
+  if(job?.status!=='done' || job.item?.replaceId!==msg.id || !job.replacement || job.draftId!==s.draft.id
+    || !s.images.some(image=>image.id===msg.id && image.draftId===s.draft.id))throw Error('검토할 새 이미지가 없습니다.');
+  const {replacement,...finished}=job;
+  if(msg.type==='DISCARD_IMAGE_REPLACEMENT'){await change({job:finished});return {};}
+  await snapshot('AI 이미지 교체 전',s);
+  const images=s.images.map(image=>image.id===msg.id ? {...replacement,caption:image.caption,alt:image.alt,
+    afterBlockId:image.afterBlockId,afterParagraph:image.afterParagraph,placement:image.placement,thumbnail:image.thumbnail||replacement.thumbnail} : image);
+  await change({images,job:finished});
   return {};
  }
  case 'CANCEL':{
@@ -444,6 +465,38 @@ async function command(msg,sender){
   const images=s.images.map(x=>x.id===msg.id?{...x,caption:text(msg.caption,1000),prompt:text(msg.prompt,3000),...position,...(msg.adopt?{draftId:s.draft.id}:{})}:x);await change({images});return {};
  }
  case 'REMOVE_IMAGE':if(busy(s.job))throw Error('생성 중입니다.');await snapshot('사진 제거 전',s);await change({images:s.images.filter(x=>x.id!==msg.id)});await log('갤러리 사진 제거','원본은 복원용으로 보관했습니다.');return {};
+ case 'PUBLISHED_RESET':{
+  if(msg.draftId!==s.draft.id || busy(s.job))throw Error('현재 글과 진행 상태를 확인해 주세요.');
+  await resetPublished(s,msg.windowId);return {};
+ }
+ case 'LOAD_TEST_DRAFT':{
+  if(busy(s.job) || (await recoverTransfer(msg.windowId))?.status==='running')throw Error('진행 중인 작업을 마친 뒤 테스트 초안을 불러와주세요.');
+  const draft=draftOf({
+   title:'[테스트] 네이버 본문 전송 점검',
+   hashtags:['테스트용','본문전송','썸네일','소제목','형광펜','밑줄','글쓰기','입력검수'],
+   content:[
+    {id:'test-first',type:'paragraph',text:'첫 번째 문단입니다. 썸네일 바로 아래에 표시되는지 확인합니다.'},
+    {id:'test-second',type:'paragraph',text:'두 번째 문단입니다. 다음 문단을 넣어도 이 문장의 끝이 그대로 유지되어야 합니다.'},
+    {id:'test-third',type:'paragraph',text:'세 번째 문단입니다. 여기에서 입력이 멈추거나 앞 문단이 바뀌는지 확인합니다.'},
+    {id:'test-heading',type:'heading',text:'소제목 색상 점검'},
+    {id:'test-highlight',type:'paragraph',text:'형광펜과 밑줄이 붙은 문구를 확인합니다. 일반 문장도 읽기 편해야 합니다.'},
+    {id:'test-final',type:'paragraph',text:'마지막 확인 문장입니다. 이 문장이 보이면 본문 입력이 끝까지 도착했습니다.'}
+   ]
+  });
+  const response=await fetch(chrome.runtime.getURL('2026-11-19-profile.png'));
+  if(!response.ok)throw Error('테스트 썸네일을 불러오지 못했습니다.');
+  const bytes=new Uint8Array(await response.arrayBuffer());
+  let binary='';
+  for(let index=0;index<bytes.length;index+=8192)binary+=String.fromCharCode(...bytes.subarray(index,index+8192));
+  const id=crypto.randomUUID();
+  const asset=await putAsset(id,'data:image/png;base64,'+btoa(binary));
+  const image={id,...asset,name:'test-thumbnail.png',caption:'테스트 썸네일',alt:'테스트 썸네일',draftId:draft.id,
+   source:'upload',thumbnail:true,placement:'auto',afterParagraph:0,at:now()};
+  await snapshot('테스트 초안 불러오기 전',s);
+  await clearDraftTransfers(s.draft.id,msg.windowId);
+  await change({draft,images:[image],reference:null,job:null,remainingImages:null,imageQueue:[]});
+  return {};
+ }
  case 'CLEAR_DRAFT':{
   if(busy(s.job)||msg.draftId!==s.draft.id)throw Error('현재 작업과 초안을 다시 확인해주세요.');
   await clearDraftTransfers(s.draft.id,msg.windowId);
@@ -510,9 +563,30 @@ chrome.runtime.onMessage.addListener((m,s,r)=>{
  });
  return true;
 });
+async function resetPublished(s,windowId){
+ await clearDraftTransfers(s.draft.id,windowId);
+ await change({draft:draftOf(),images:[],reference:null,job:null,remainingImages:null,imageQueue:[],form:formOf({...s.form,topic:'',useArticleReference:false,articleTitle:'',articleBody:'',articleSource:'',sourceNotes:'',notes:'',keywords:''})});
+ await chrome.storage.session.remove('publish:'+windowId);
+ await log('발행 완료 · 작업 초안과 갤러리 초기화');
+}
+async function verifyPublished(tabId,tab){
+ const url=new URL(tab.url);
+ if(url.hostname!=='blog.naver.com'||!(/^\/[^/]+\/\d+\/?$/.test(url.pathname)||(/^\/PostView.naver$/i.test(url.pathname)&&/^\d+$/.test(url.searchParams.get('logNo')||''))))return;
+ const key='publish:'+tab.windowId;
+ const pending=(await chrome.storage.session.get(key))[key];
+ if(!pending||pending.tabId!==tabId)return;
+ const s=await read();
+ if(s.draft.id!==pending.draftId||busy(s.job))return;
+ const frames=await chrome.scripting.executeScript({target:{tabId,allFrames:true},func:()=>({
+  title:document.querySelector('.se-documentTitle .se-title-text')?.innerText?.trim(),
+  success:[...document.querySelectorAll('[role=status],[role=alert],.toast_message')].some(el=>/발행되었습니다|발행이 완료/.test(el.innerText))
+ })});
+ if(frames.some(f=>f.result?.title===pending.title)&&frames.some(f=>f.result?.success))await resetPublished(s,tab.windowId);
+}
 async function setup(){await chrome.storage.local.setAccessLevel({accessLevel:'TRUSTED_CONTEXTS'});await chrome.storage.session.setAccessLevel({accessLevel:'TRUSTED_CONTEXTS'});await chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:true});await chrome.alarms.create('buja-watchdog',{periodInMinutes:1});}
 chrome.runtime.onInstalled.addListener(()=>{void setup();});chrome.runtime.onStartup.addListener(()=>{void setup();});
-chrome.tabs.onUpdated.addListener((id,info)=>{
+chrome.tabs.onUpdated.addListener((id,info,tab)=>{
+ if(info.status==="complete" && tab.url)void serial(()=>verifyPublished(id,tab)).catch(()=>{});
  if(info.status==='loading'||info.url) void serial(()=>invalidateEditor(id,'연결된 탭이 이동 또는 새로고침되었습니다. 다시 연결해주세요.'));
 });
 chrome.tabs.onRemoved.addListener(id=>{void serial(async()=>{

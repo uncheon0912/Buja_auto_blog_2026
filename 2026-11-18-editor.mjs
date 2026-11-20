@@ -186,8 +186,9 @@ export async function editorBridge(mode, platform, payload = {}) {
           ? [...node.classList].filter(name => !name.startsWith('se-is-')).join(' ') : node.className || ''))
     });
   }
-  const occupied = !!read(title) || !!bodyText() || photos().length > 0
+  const bodyOccupied = !!bodyText() || photos().length > 0
     || !!container.querySelector('.se-component:not(.se-text):not(.se-documentTitle), iframe, video, table, figure');
+  const occupied = !!read(title) || bodyOccupied;
   const editorState = documents.get(container);
   if (platform === 'naver' && !editorState.listen) {
     editorState.listen = true;
@@ -197,7 +198,7 @@ export async function editorBridge(mode, platform, payload = {}) {
       editorState.clicked = container.contains(paragraph) ? paragraph : null;
     }, true);
   }
-  if (mode === 'probe') return { found: true, occupied, token, sharedInput: !!sharedInput, inputPath, imageReady: !!upload() || !!photoToolbar() };
+  if (mode === 'probe') return { found: true, occupied, bodyOccupied, title:read(title), token, sharedInput: !!sharedInput, inputPath, imageReady: !!upload() || !!photoToolbar() };
   if (payload.token !== token) return { status: 'review', message: '글쓰기 문서가 바뀌었습니다. 편집기를 확인해주세요.' };
 
   function selection(node, end = true) {
@@ -298,10 +299,10 @@ export async function editorBridge(mode, platform, payload = {}) {
     return image && (!text || precedes(text, image)) ? image : text;
   }
 
-  async function checkedTail() {
+  async function checkedTail(requireBlank=false, allowExisting=true) {
     const last = lastBodyParagraph();
     const content = lastContent();
-    if (last && (!content || last.contains(content) || precedes(content, last))) return last;
+    if (last && (!requireBlank || !read(last)) && (!content || last.contains(content) || precedes(content, last))) return last;
     if (!content && !sharedInput) return body;
     if (sharedInput) {
       const terminal = content || title;
@@ -321,6 +322,7 @@ export async function editorBridge(mode, platform, payload = {}) {
         buttons[0].click();
         if (await waitForText(hasBlankAfterContent, 12)) return next;
       }
+      if(requireBlank && allowExisting && !buttons.length && last && (last===content || last.contains(content)))return last;
       const box = component.getBoundingClientRect();
       const article = container.getBoundingClientRect();
       const x = Math.max(article.left + 1, Math.min(article.right - 1, (box.left + box.right) / 2));
@@ -366,20 +368,50 @@ export async function editorBridge(mode, platform, payload = {}) {
     const before = comparableText(bodyText());
     const beforeTitle = read(title);
     const terminalBefore = lastContent();
-    const last = await checkedTail();
-    if (!last.isConnected || signature() !== operation.baseline) {
-      throw Object.assign(Error('본문을 준비하는 중 편집기 내용이 바뀌었습니다.'),{code:'EDITOR_CHANGED_BEFORE_PASTE'});
+    let last = await checkedTail(Boolean(sharedInput), !step.freshBody);
+    const verifyUnchanged = () => {
+      if (!last.isConnected || signature() !== operation.baseline) {
+        throw Object.assign(Error('본문을 준비하는 중 편집기 내용이 바뀌었습니다.'),{code:'EDITOR_CHANGED_BEFORE_PASTE'});
+      }
+    };
+    verifyUnchanged();
+    let addBreak = Boolean(read(last));
+    let buffer;
+    function focusPasteTarget() {
+      buffer = sharedSelection(last, addBreak);
+      const selected = buffer.ownerDocument.getSelection();
+      if (read(buffer)) {
+        if (!addBreak || comparableText(read(buffer)) !== comparableText(read(last))) return false;
+        const end = buffer.ownerDocument.createRange();
+        end.selectNodeContents(buffer);
+        end.collapse(false);
+        selected?.removeAllRanges();
+        selected?.addRange(end);
+      }
+      if (!selected?.isCollapsed || (selected.anchorNode && !buffer.contains(selected.anchorNode))) return false;
+      if (step.freshBody && buffer.ownerDocument.queryCommandState('bold')) {
+        buffer.ownerDocument.execCommand('bold',false);
+        if (buffer.ownerDocument.queryCommandState('bold')) return false;
+      }
+      return true;
     }
+    if (sharedInput && !focusPasteTarget()) {
+      verifyUnchanged();
+      last = await checkedTail(true, false);
+      verifyUnchanged();
+      addBreak = false;
+      if (read(last) || !focusPasteTarget()) {
+        throw Object.assign(Error('새 빈 문단에 입력할 위치를 확인하지 못했습니다.'),{code:'BODY_EMPTY_TARGET_UNVERIFIED'});
+      }
+    }
+    verifyUnchanged();
     const media = photos().map(photoRecord);
     const prefix = sharedInput ? flowThroughLastPhoto() : null;
-    const addBreak = Boolean(read(last));
     const mayUsePlainInput = sharedInput && !addBreak && terminalBefore === photos().at(-1)
       && !!terminalBefore && precedes(terminalBefore,last);
     const html = (addBreak ? '<p><br></p>' : '') + step.html;
-    let buffer;
     let bufferBefore;
     if (sharedInput) {
-      buffer = sharedSelection(last, addBreak);
       bufferBefore = buffer.innerHTML;
       operation.unknown = true;
       pasteText(buffer, (addBreak ? '\n' : '') + step.text, html);
@@ -467,7 +499,9 @@ export async function editorBridge(mode, platform, payload = {}) {
         ...(nativeAttempted ? {inputPath:'smarteditor-native-plain'} : {}),
         ...(alternate !== null ? {alternateTextLength:Array.from(alternate).length,alternateMatches:alternate===expected} : {}),
         ...(observed !== expected ? textDifference(expected, observed, Array.from(before).length) : {})};
-      throw Object.assign(Error(reason),{diagnostic:diagnostic('verify-body',code,{...detail,source:'editor.appendNaverText'})});
+      const location = detail.differenceRegion === 'previous-body' ? ' 직전에 입력한 문단에서 첫 차이가 확인됐습니다.'
+        : detail.firstDifference ? ' 이번 입력 구역에서 첫 차이가 확인됐습니다.' : '';
+      throw Object.assign(Error(reason + location),{diagnostic:diagnostic('verify-body',code,{...detail,source:'editor.appendNaverText'})});
     }
     return diagnostic('verify-body','BODY_VERIFIED',{pasteDispatched:true, attempts, waitMs:Math.round(performance.now() - started),
       expectedLength:Array.from(expected).length, observedLength:Array.from(observed).length, rowsCount,
@@ -495,7 +529,8 @@ export async function editorBridge(mode, platform, payload = {}) {
 
   function findBlock(block) {
     if (!block?.needle) return null;
-    const elements = [...container.querySelectorAll('p,h2,h3,li,blockquote,.se-text-paragraph,[contenteditable="true"]')];
+    const selectors = 'p,h2,h3,li,blockquote,.se-text-paragraph,[contenteditable="true"]';
+    const elements = [...container.querySelectorAll(platform === 'tistory' ? selectors + ',div' : selectors)];
     const matches = elements.filter(node => node !== title && !title.contains(node) && read(node) === normalized(block.needle));
     const innermost = matches.filter(node => !matches.some(other => other !== node && node.contains(other)));
     return innermost.length === 1 ? innermost[0] : null;
@@ -506,11 +541,9 @@ export async function editorBridge(mode, platform, payload = {}) {
     if (!node) return false;
     if (block.type === 'heading') {
       if (platform === 'naver') {
-        const hex = /^#[0-9a-f]{6}$/i.test(payload.accent) ? payload.accent.slice(1) : '08796b';
-        const rgb = 'rgb(' + [0, 2, 4].map(offset => parseInt(hex.slice(offset, offset + 2), 16)).join(', ') + ')';
         const textNodes = [node, ...node.querySelectorAll('span,strong,b,font')].filter(element =>
           visible(element) && [...element.childNodes].some(child => child.nodeType === 3 && child.textContent.trim()));
-        return !!textNodes.length && textNodes.every(element => bodyDoc.defaultView.getComputedStyle(element).color === rgb);
+        return !!textNodes.length && textNodes.every(element => (()=>{const css=bodyDoc.defaultView.getComputedStyle(element);return !element.closest('blockquote,.se-quotation,.se-section-quotation') && parseFloat(css.fontSize)>=20 && parseInt(css.fontWeight,10)>=600;})());
       }
       return !!node.closest('h2,h3,[role="heading"]');
     }
@@ -522,17 +555,26 @@ export async function editorBridge(mode, platform, payload = {}) {
   }
 
   if (mode === 'begin') {
-    if (session.has(payload.transferId) || occupied) return { status: 'blocked', message: '기존 글·사진이 있습니다. 새 빈 글쓰기창을 열어주세요.' };
-    if (payload.hasPhotos && !upload() && !photoToolbar()) {
+    const canRestart = payload.restart === true && !bodyOccupied && (!read(title) || read(title) === normalized(payload.title));
+    if (session.has(payload.transferId) || (occupied && !canRestart)) return { status: 'blocked', message: '기존 글·사진이 있습니다. 새 빈 글쓰기창을 열어주세요.' };
+    if (platform !== 'tistory' && payload.hasPhotos && !upload() && !photoToolbar()) {
       return { status: 'blocked', message: '사진 첨부 입력창을 확인하지 못했습니다. 편집기의 사진 도구를 확인해주세요.' };
     }
     try {
       const expected = normalized(payload.plainText).replace(/\s/g, '');
       if (platform === 'naver') {
-        await enterNaverTitle();
+        if (!read(title)) await enterNaverTitle();
         session.clear();
         session.set(payload.transferId, {baseline: signature(), next: 0, cursor: 0, unknown: false});
         return {status: 'ok', formatWarnings: []};
+      } else if (platform === 'tistory') {
+        if (!read(title)) inputTitle(payload.title);
+        if (!await waitForText(() => read(title) === normalized(payload.title))) {
+          return {status:'review', message:'티스토리 제목 입력을 확인하지 못했습니다.'};
+        }
+        selection(body, false);
+        if (!bodyDoc.execCommand('insertHTML', false, payload.html)) throw Error('티스토리 본문 입력이 거부되었습니다.');
+        container.dispatchEvent(new Event('change', { bubbles: true }));
       } else {
         selection(body, false);
         if (!bodyDoc.execCommand('insertHTML', false, payload.html)) throw Error('본문 입력이 거부되었습니다.');
@@ -639,15 +681,70 @@ export async function editorBridge(mode, platform, payload = {}) {
   if (mode !== 'photo') return { status: 'review', message: '지원하지 않는 입력 단계입니다.' };
   if (operation.next !== payload.index) return {status: 'review', message: '사진 순서가 바뀌었습니다. 편집기를 확인해주세요.'};
 
-  const { image, anchor, following, tail } = payload;
+  const { image, anchor, following, tail, textOffset } = payload;
+  const tistory = platform === 'tistory' && Number.isInteger(textOffset);
+  const offsetBefore = node => {
+    const prefix = bodyDoc.createRange();
+    prefix.selectNodeContents(body);
+    prefix.setEndBefore(node);
+    return comparableText(prefix.toString()).length;
+  };
+  function tistoryPhotoCaret() {
+    const caret = bodyDoc.createRange();
+    const previous = photos().findLast(img => offsetBefore(img) === textOffset);
+    if (previous) {
+      caret.setStartAfter(previous.closest('figure') || previous);
+      caret.collapse(true);
+      return caret;
+    }
+    caret.selectNodeContents(body);
+    caret.collapse(true);
+    if (textOffset === 0) return caret;
+    const walker = bodyDoc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    let offset = 0;
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const count = comparableText(text.data).length;
+      if (count && offset + count >= textOffset) {
+        if (offset + count === textOffset) {
+          const paragraph = text.parentElement.closest('p,h2,h3,li,blockquote,div');
+          if (paragraph && paragraph !== body
+            && offsetBefore(paragraph) + comparableText(paragraph.textContent).length === textOffset) {
+            caret.selectNodeContents(paragraph);
+            caret.collapse(false);
+            return caret;
+          }
+        }
+        for (let i=1; i<=text.length; i++) {
+          if (offset + comparableText(text.data.slice(0,i)).length === textOffset) {
+            caret.setStart(text,i);
+            caret.collapse(true);
+            return caret;
+          }
+        }
+        return null;
+      }
+      offset += count;
+    }
+    return null;
+  }
+  function selectPhoto(node, end) {
+    if (!tistory) return selection(node,end);
+    body.focus();
+    const caret = tistoryPhotoCaret();
+    if (!caret) throw Error('티스토리에서 사진을 넣을 본문 위치를 확인하지 못했습니다.');
+    const selected = bodyDoc.getSelection();
+    selected.removeAllRanges();
+    selected.addRange(caret);
+  }
   if (!/^data:image\/(png|jpeg|webp);base64,/.test(image?.data || '')) {
     return { status: 'retryable', message: '사진 파일 형식을 확인해주세요. 이번 사진은 전송하지 않았습니다.' };
   }
 
   let dispatchPhoto;
+  let photoInputPath = sharedInput ? 'smarteditor-file-paste' : 'file-input';
   try {
     const node = tail ? await checkedTail() : anchor ? findBlock(anchor) : body;
-    if (!node || (following && !findBlock(following))) {
+    if (!node || (!tistory && following && !findBlock(following))) {
       return { status: 'review', message: '사진을 배치할 위치를 확인하지 못했습니다. 편집기를 확인해주세요.' };
     }
     const blob = await (await fetch(image.data)).blob();
@@ -659,6 +756,10 @@ export async function editorBridge(mode, platform, payload = {}) {
     if (sharedInput) {
       const input = sharedSelection(node, tail ? Boolean(read(node)) : !!anchor);
       dispatchPhoto = () => sendPaste(input, data);
+    } else if (platform === 'tistory' && !upload()) {
+      selectPhoto(node, !!anchor);
+      photoInputPath = 'tistory-file-paste';
+      dispatchPhoto = () => sendPaste(body, data);
     } else {
       let field = upload();
       if (!field && photoToolbar()) {
@@ -669,7 +770,7 @@ export async function editorBridge(mode, platform, payload = {}) {
       if (signature() !== operation.baseline || !field.isConnected || !node.isConnected) {
         return { status: 'review', message: '사진 준비 중 편집기가 바뀌었습니다. 입력을 멈췄습니다.' };
       }
-      selection(node, tail ? Boolean(read(node)) : !!anchor);
+      selectPhoto(node, tail ? Boolean(read(node)) : !!anchor);
       field.files = data.files;
       dispatchPhoto = () => field.dispatchEvent(new Event('change', { bubbles: true }));
     }
@@ -684,7 +785,7 @@ export async function editorBridge(mode, platform, payload = {}) {
   const beforeBody = bodyText();
   const photoStarted = performance.now();
   const photoCheck = (code, current, attempts) => diagnostic('verify-photo',code,{
-    inputPath:sharedInput ? 'smarteditor-file-paste' : 'file-input',
+    inputPath:photoInputPath,
     pasteDispatched:true, waitMs:Math.round(performance.now() - photoStarted), attempts,
     expectedPhotos:before.size + 1, observedPhotos:current.length,
     loadedPhotos:current.filter(img => img.complete && img.naturalWidth > 0
@@ -714,7 +815,7 @@ export async function editorBridge(mode, platform, payload = {}) {
     }
     const left = anchor ? findBlock(anchor) : null;
     const right = following ? findBlock(following) : null;
-    if ((anchor && (!left || !(left.compareDocumentPosition(img) & 4)))
+    if ((tistory && offsetBefore(img) !== textOffset) || (anchor && (!left || !(left.compareDocumentPosition(img) & 4)))
       || (following && (!right || !(img.compareDocumentPosition(right) & 4)))) {
       return { status: 'review', message: '사진은 보이지만 예정한 위치와 다릅니다. 편집기에서 배치를 확인해주세요.',
         diagnostic:photoCheck('PHOTO_ORDER_MISMATCH',current,photoAttempts) };
