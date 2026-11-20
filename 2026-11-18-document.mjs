@@ -79,7 +79,24 @@ export function textOfBlock(block) {
 }
 
 export function blocksOf(draft) {
-  if (draft.content?.length) return draft.content;
+  if (draft.content?.length) {
+    const ids = new Set(draft.content.map(block => block.id));
+    return draft.content.flatMap(block => {
+      if (!['callout','blockquote'].includes(block.type)) return [block];
+      const lines = (block.text || '').trim().split(/\n+/);
+      const title = block.title?.trim() || (Array.from(lines[0]).length <= 14 ? lines.shift() : '');
+      const body = lines.join('\n').trim();
+      if (!title) return [{id:block.id,type:'paragraph',text:body}];
+      let id = block.id;
+      if (body) {
+        id += '-heading';
+        while (ids.has(id)) id += '_';
+        ids.add(id);
+      }
+      const heading = {id,type:'heading',level:2,text:shortHeading(title)};
+      return body ? [heading,{id:block.id,type:'paragraph',text:body}] : [heading];
+    });
+  }
   return splitBody(draft.body).map((text, index) => ({ id: 'legacy-' + (index + 1), type: 'paragraph', text }));
 }
 
@@ -125,6 +142,7 @@ function listHTML(items, tag, checklist = false) {
 }
 
 export function renderBlock(block, accent, article = false, headingColor = false) {
+  if(block.id?.startsWith('editorial-divider-') && block.text==='---')return '<hr>';
   const content = htmlText(block.text || '');
   const accented = 'border-left:4px solid ' + accent
     + (article ? ';background-color:' + accent + '14;padding:10px 12px;border-radius:8px' : ';padding-left:10px');

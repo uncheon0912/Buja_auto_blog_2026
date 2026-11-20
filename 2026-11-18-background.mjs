@@ -1,7 +1,7 @@
-import {seriesNames,seriesDirection,VERSION,busy,text,formOf,draftOf,parseDraft,articlePrompt,imagePrompt,imageOverlayText,thumbnailOverlayText,imageSeriesStyle,planImageBatch,backupOf,validateImage,validRepo,newer} from './2026-11-18-core.mjs';
+import {layoutArticle,reviewArticle,seriesNames,seriesDirection,VERSION,busy,text,formOf,draftOf,parseDraft,articlePrompt,imagePrompt,imageOverlayText,thumbnailOverlayText,imageSeriesStyle,planImageBatch,backupOf,validateImage,validRepo,newer} from './2026-11-18-core.mjs';
 import {putAsset,getData} from './2026-11-18-assets.mjs';
-import {connectionFor, recoverTransfer, connectEditor, disconnectEditor, focusConnected, invalidateEditor, sendDraft} from './2026-11-18-transfer.mjs';
-const defaults={form:formOf(),draft:draftOf(),images:[],reference:null,history:[],logs:[],job:null,imageQueue:[],aiTabId:null,settings:{repo:''},onboarded:false};
+import {insertGalleryPhoto,clearDraftTransfers,connectionFor, recoverTransfer, connectEditor, disconnectEditor, focusConnected, invalidateEditor, sendDraft} from './2026-11-18-transfer.mjs';
+const defaults={remainingImages:null,form:formOf(),draft:draftOf(),images:[],reference:null,history:[],logs:[],job:null,imageQueue:[],aiTabId:null,settings:{repo:''},onboarded:false};
 const read=async()=>({...defaults,...await chrome.storage.local.get(Object.keys(defaults))});
 const now=()=>new Date().toISOString();
 const change=values=>chrome.storage.local.set(values);
@@ -12,17 +12,29 @@ async function log(event,detail='',diagnostic){
 }
 const trace = (event,detail) => log(event,'',detail).catch(()=>{});
 function generationTrace(job,event,stage,details={}){
- return trace(event,{operationId:job.batchId || job.id,requestId:job.id,kind:job.kind,stage,
+ return trace(event,{operationId:job.batchId || job.id,requestId:job.id,kind:job.kind,provider:job.provider || "Gemini",stage,
   source:'background',...(job.kind==='image' ? {photoIndex:job.photoIndex,expectedPhotos:job.batchCount} : {}),...details});
 }
 async function snapshot(reason,s=null){s ||= await read();if(!s.draft.title&&!s.images.length)return;await change({history:[{id:crypto.randomUUID(),at:now(),reason,form:s.form,draft:s.draft,images:s.images,reference:s.reference},...s.history].slice(0,30)});}
 const geminiOrigin = 'https://gemini.google.com/';
+const providerOrigin = provider => provider==='ChatGPT'?'https://chatgpt.com/':geminiOrigin;
+const providerName = job => job.provider || "Gemini";
 async function releaseGeminiTab(tabId) {
  if (Number.isInteger(tabId)) await chrome.tabs.update(tabId, {autoDiscardable: true}).catch(() => {});
 }
 async function closeFinishedGemini(job) {
+ if(job.provider==='ChatGPT'){
+  for(let attempt=0;attempt<2;attempt++){
+   const work=await chrome.tabs.get(job.tabId).catch(()=>null);
+   if(!work)return;
+   if(work.windowId!==job.windowId || !work.url?.startsWith(providerOrigin('ChatGPT')))break;
+   try{await chrome.tabs.remove(work.id);return;}catch{await new Promise(resolve=>setTimeout(resolve,250));}
+  }
+  await generationTrace(job,'ChatGPT 작업 탭 닫기 확인 필요','close-tab',{code:'GPT_TAB_CLOSE_UNCONFIRMED'});
+  await releaseGeminiTab(job.tabId);return;
+ }
  const tab = await chrome.tabs.get(job.tabId).catch(() => null);
- if (tab && tab.windowId === job.windowId && tab.url?.startsWith(geminiOrigin)) {
+ if (tab && tab.windowId === job.windowId && tab.url?.startsWith(providerOrigin(job.provider))) {
   try {
    await chrome.tabs.remove(tab.id);
    return;
@@ -30,78 +42,105 @@ async function closeFinishedGemini(job) {
  }
  await releaseGeminiTab(job.tabId);
 }
-async function openGeminiWindow() {
+async function openGeminiWindow(provider='Gemini') {
  try {
-  const window = await chrome.windows.create({url: geminiOrigin + 'app', type: 'normal', focused: true});
+  const window = await chrome.windows.create({url: provider==='ChatGPT'?providerOrigin(provider):geminiOrigin+'app', type: 'normal', focused: true});
   const [tab] = window?.tabs?.length ? window.tabs : window ? await chrome.tabs.query({windowId: window.id}) : [];
   if (!Number.isInteger(tab?.id)) throw Error('Gemini tab unavailable');
   await chrome.tabs.update(tab.id, {autoDiscardable: false}).catch(() => {});
   return tab;
  } catch {
-  throw Object.assign(new Error('새 Gemini 창을 열지 못했습니다. Chrome 창과 인터넷 연결을 확인해주세요.'), {code: 'GEMINI_CONNECTION'});
+  throw Object.assign(new Error('새 '+provider+' 창을 열지 못했습니다. Chrome 창과 인터넷 연결을 확인해주세요.'), {code: 'GEMINI_CONNECTION'});
  }
 }
+async function rememberComposer(provider,digest){
+ const {composerDigests={}}=await chrome.storage.local.get('composerDigests');
+ const previous=composerDigests[provider] || [];
+ await change({composerDigests:{...composerDigests,[provider]:[digest,...previous.filter(value=>value!==digest)].slice(0,20)}});
+}
 async function start(job,attachments=[]){
+ const provider=providerName(job);
+ const {composerDigests={},imageComposerDigests=[]}=await chrome.storage.local.get(['composerDigests','imageComposerDigests']);
+ const knownComposerDigests=[...(composerDigests[provider]||[]),...(provider==='ChatGPT'?imageComposerDigests:[])];
+ if(provider==='ChatGPT')job={...job,prompt:job.prompt.replace(/^Gemini 이미지 생성/,'ChatGPT 이미지 생성')};
  await change({job});
- try{const r=await chrome.tabs.sendMessage(job.tabId,{type:'BUJA_START',job,attachments},{frameId:0});if(!r?.ok)throw Error(r?.error||'Gemini가 요청을 받지 못했습니다.');}
+ try{const r=await chrome.tabs.sendMessage(job.tabId,{type:'BUJA_START',job:{...job,knownComposerDigests},attachments},{frameId:0});if(!r?.ok)throw Error(r?.error||providerName(job)+'에서 요청을 받지 못했습니다.');}
  catch(e){
-  const error = job.kind === 'article' ? Object.assign(new Error('Gemini에 요청을 전달하지 못했습니다. 열린 탭에서 연결을 확인한 뒤 초안 작성을 다시 눌러주세요.'), {code:'GEMINI_CONNECTION'}) : e;
+  const error = job.kind === 'article' ? Object.assign(new Error(providerName(job)+'에 요청을 전달하지 못했습니다. 열린 탭에서 연결을 확인한 뒤 초안 작성을 다시 눌러주세요.'), {code:'GEMINI_CONNECTION'}) : e;
   await change({job:{...job,status:'error',error:error.message,code:error.code,ended:now()},imageQueue:[]});
   await log('연결 실패',error.message);
   throw error;
  }
 }
-async function waitGemini(tabId) {
- let inspected = false;
- let attemptedInjection = false;
+async function waitGemini(tabId,provider='Gemini') {
+ let attemptedInjection=false;
  let status;
- function fail(message) {
-  return Object.assign(new Error(message), {code: 'GEMINI_CONNECTION'});
- }
- for (let attempt = 0; attempt < 40; attempt++) {
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab) throw fail('Gemini 탭이 닫혔습니다. 초안 작성을 다시 눌러주세요.');
-  if (attempt > 0 && tab.status === 'complete' && !tab.url?.startsWith(geminiOrigin)) {
-   throw fail('Gemini가 로그인 또는 오류 화면으로 이동했습니다. 열린 탭에서 화면을 확인한 뒤 초안 작성을 다시 눌러주세요.');
+ const deadline=Date.now()+25000;
+ const fail=(code,message)=>Object.assign(new Error(provider+' '+message),{code});
+ do {
+  const tab=await chrome.tabs.get(tabId).catch(()=>null);
+  if(!tab)throw fail('AI_TAB_CLOSED','작업 탭이 닫혔습니다. 다시 요청해주세요.');
+  if(tab.status==='complete' && tab.url && !tab.url.startsWith(providerOrigin(provider))) {
+   const url=new URL(tab.url);
+   if(['auth.openai.com','accounts.google.com'].includes(url.hostname)){
+    throw fail('AI_LOGIN_REQUIRED','로그인 화면이 열렸습니다. 로그인한 뒤 다시 요청해주세요.');
+   }
+   if(tab.url!=='about:blank')throw fail('AI_TAB_LEFT_PROVIDER','작업 탭이 다른 주소로 이동했습니다. 열린 화면을 확인해주세요.');
   }
-  try {
-   status = await chrome.tabs.sendMessage(tabId, {type: 'BUJA_PING'}, {frameId: 0});
-   inspected = true;
-   if (status?.ready && !status.busy && !status.running) return;
-  } catch {
-   if (!attemptedInjection && tab.status === 'complete' && tab.url?.startsWith(geminiOrigin)) {
-    attemptedInjection = true;
-    await chrome.scripting.executeScript({
-     target: {tabId}, files: ['2026-11-18-gemini.js']
-    }).catch(() => {});
+  try{
+   status=await chrome.tabs.sendMessage(tabId,{type:'BUJA_PING'},{frameId:0});
+   if(status?.ready && !status.busy && !status.running)return;
+   if(status?.loginRequired)break;
+  }catch{
+   if(!attemptedInjection && tab.status==='complete' && tab.url?.startsWith(providerOrigin(provider))){
+    attemptedInjection=true;
+    await chrome.scripting.executeScript({target:{tabId},files:['2026-11-18-gemini.js']}).catch(()=>{});
    }
   }
-  await new Promise(resolve => setTimeout(resolve, 250));
- }
- if (status?.busy || status?.running) {
-  throw fail('Gemini가 다른 응답을 생성하고 있습니다. 생성이 끝난 뒤 초안 작성을 다시 눌러주세요.');
- }
- if (!inspected) throw fail('Gemini와 연결하지 못했습니다. 열린 Gemini 탭에서 페이지가 로드됐는지 확인해주세요.');
- throw fail('Gemini 입력창이 준비되지 않았습니다. 열린 Gemini 탭에서 직접 로그인한 뒤 초안 작성을 다시 눌러주세요.');
+  await new Promise(resolve=>setTimeout(resolve,250));
+ }while(Date.now()<deadline);
+ if(status?.loginRequired)throw fail('AI_LOGIN_REQUIRED','로그인 화면이 감지됐습니다. 로그인한 뒤 다시 요청해주세요.');
+ if(status?.busy || status?.running)throw fail('AI_COMPOSER_BUSY','응답 생성이 끝난 뒤 다시 요청해주세요.');
+ if(!status)throw fail('AI_TAB_UNREACHABLE','작업 탭과 통신하지 못했습니다. 열린 창이 정상 로드됐는지 확인해주세요.');
+ await trace(provider+' 입력창 탐색 시간 초과',{provider,stage:'composer-probe',source:'background.waitGemini',candidateCount:status.candidateCount,sendFound:status.sendFound,code:'AI_COMPOSER_NOT_FOUND'});
+ throw fail('AI_COMPOSER_NOT_FOUND','작성란을 찾지 못했습니다. 열린 창에서 작성란이 보이고 입력할 수 있는지 확인해주세요.');
 }
 async function beginArticle(msg,s){
  if(busy(s.job))throw Error('진행 중인 작업을 기다리거나 수집을 중단해주세요.');
  const form=formOf(msg.form);const photos=s.images.filter(x=>x.source==='upload'&&x.draftId===s.draft.id);if(form.mode==='photo'&&!photos.length)throw Error('내 사진으로 글쓰기에서는 사진을 먼저 추가해주세요.');
  const prompt=articlePrompt(form,msg.revision?s.draft:null,msg.revision,photos);
+ const recovery=msg.recoverJobId && s.job?.id===msg.recoverJobId && s.job.status==='error'
+  && s.job.kind==='article' && s.job.provider===form.textAI && s.job.blockedComposerDigest ? s.job : null;
+ if(msg.recoverJobId&&!recovery)throw Error('현재 차단된 초안 작업을 다시 확인해주세요.');
+ if(s.job?.provider===form.textAI && s.job.prompt && ['article','image'].includes(s.job.kind)){
+  const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s.job.prompt.replace(/\s+/gu,' ').trim()));
+  await rememberComposer(form.textAI,Array.from(new Uint8Array(bytes),n=>n.toString(16).padStart(2,'0')).join(''));
+ }
  const attachments=[];if(form.mode==='photo'){if(photos.reduce((n,p)=>n+p.size,0)>20*1024*1024)throw Error('AI에 첨부할 사진 전체 용량을 20MB 이하로 줄여주세요.');for(const p of photos)attachments.push({name:p.name,data:await getData(p.id)});}
- let job = {id:crypto.randomUUID(), kind:'article', status:'preparing', stage:'connecting', started:now(), prompt};
+ let job = {id:crypto.randomUUID(), kind:'article', provider:form.textAI,length:form.length,status:'preparing', stage:'connecting', started:now(), prompt,...(recovery?{replaceComposerDigest:recovery.blockedComposerDigest}:{})};
  await change({job, form, imageQueue:[]});
- await generationTrace(job,'Gemini 초안 연결 시작','connect',{promptLength:prompt.length,attachmentCount:attachments.length});
+ await generationTrace(job,providerName(job)+' 초안 연결 시작','connect',{promptLength:prompt.length,attachmentCount:attachments.length});
  try {
-  const tab = await openGeminiWindow();
+  let tab = recovery ? await chrome.tabs.get(recovery.tabId) : await openGeminiWindow(form.textAI);
   job = {...job, tabId:tab.id, windowId:tab.windowId};
   await change({job, aiTabId:tab.id});
-  await waitGemini(tab.id);
+  await waitGemini(tab.id,form.textAI);
+  if(!recovery){
+   const occupied=await occupiedComposer(tab.id,form.textAI);
+   if(occupied){
+    await generationTrace(job,providerName(job)+' 기존 입력 보존 · 새 작업 창 재시도','composer-retry');
+    await releaseGeminiTab(tab.id);
+    tab=await openGeminiWindow(form.textAI);
+    job={...job,tabId:tab.id,windowId:tab.windowId};
+    await change({job,aiTabId:tab.id});
+    await waitGemini(tab.id,form.textAI);
+   }
+  }
   job = {...job, status:'running', stage:'request', requested:now()};
   await start(job,attachments);
-  await generationTrace(job,'Gemini 초안 요청 전달','request');
+  await generationTrace(job,providerName(job)+' 확장 작업 접수','request');
  } catch (error) {
-  await generationTrace(job,'Gemini 초안 요청 실패',job.stage,{code:error.code || 'DRAFT_REQUEST_FAILED'});
+  await generationTrace(job,providerName(job)+' 초안 요청 실패',job.stage,{code:error.code || 'DRAFT_REQUEST_FAILED'});
   await change({job:{...job,status:'error',error:error.message,code:error.code,ended:now()}});
   await releaseGeminiTab(job.tabId);
   throw error;
@@ -109,18 +148,30 @@ async function beginArticle(msg,s){
  await log('초안 생성 요청',form.topic).catch(()=>{});
  return {jobId:job.id};
 }
+async function occupiedComposer(tabId,provider,kind="article"){
+   const {composerDigests={},imageComposerDigests=[]}=await chrome.storage.local.get(['composerDigests','imageComposerDigests']);
+   const known=[...(composerDigests[provider]||[]),...(provider==='ChatGPT'?imageComposerDigests:[])];
+   const inspection=await chrome.tabs.sendMessage(tabId,{type:'BUJA_INSPECT_ARTICLE',known,kind},{frameId:0});
+ return inspection?.unknown;
+}
 async function beginImages(items) {
  const batchId = crypto.randomUUID();
  const {draft,form} = await read();
  const visualStyle = imageSeriesStyle(form,draft);
- await trace('Gemini 이미지 배치 시작',{operationId:batchId,kind:'image',stage:'connect',source:'background.beginImages',expectedPhotos:items.length});
+ await trace(form.imageAI+' 이미지 배치 시작',{operationId:batchId,kind:'image',stage:'connect',source:'background.beginImages',expectedPhotos:items.length});
  let tab;
  try {
-  tab = await openGeminiWindow();
-  await change({aiTabId:tab.id,imageQueue:items.map((item,index)=>({...item,visualStyle,batchId,photoIndex:index + 1,batchCount:items.length}))});
+  tab = await openGeminiWindow(form.imageAI);
+  await waitGemini(tab.id,form.imageAI);
+  if(await occupiedComposer(tab.id,form.imageAI,"image")){
+   await trace(form.imageAI+' 기존 입력 보존 · 이미지 작업 창 재시도',{operationId:batchId,provider:form.imageAI,kind:'image',stage:'composer-retry'});
+   await releaseGeminiTab(tab.id);
+   tab=await openGeminiWindow(form.imageAI);
+  }
+  await change({remainingImages:{draftId:draft.id,items},aiTabId:tab.id,imageQueue:items.map((item,index)=>({...item,provider:form.imageAI,visualStyle,batchId,photoIndex:index + 1,batchCount:items.length}))});
   await nextImage();
  } catch (error) {
-  await trace('Gemini 이미지 배치 요청 실패',{operationId:batchId,kind:'image',stage:'request',source:'background.beginImages',code:error.code || 'IMAGE_REQUEST_FAILED'});
+  await trace(form.imageAI+' 이미지 배치 요청 실패',{operationId:batchId,kind:'image',stage:'request',source:'background.beginImages',code:error.code || 'IMAGE_REQUEST_FAILED'});
   await change({imageQueue:[]});
   await releaseGeminiTab(tab?.id);
   throw error;
@@ -130,13 +181,14 @@ async function nextImage(){
  const s=await read();if(busy(s.job)||!s.imageQueue.length)return;
  const [item,...remaining]=s.imageQueue;
  const tabId=s.aiTabId;
- await waitGemini(tabId);
+ const provider=item.provider || s.form.imageAI;
+ await waitGemini(tabId,provider);
  const {windowId}=await chrome.tabs.get(tabId);
  const attachments=s.form.referenceRequired&&s.reference?[{name:s.reference.name,data:await getData(s.reference.id)}]:[];
- const job={id:crypto.randomUUID(),kind:'image',status:'running',tabId,windowId,started:now(),draftId:s.draft.id,item,prompt:imagePrompt(s.form,{...s.draft,imageSeriesStyle:item.visualStyle},item),
+ const job={id:crypto.randomUUID(),kind:'image',status:'running',provider,tabId,windowId,started:now(),draftId:s.draft.id,item,prompt:imagePrompt(s.form,{...s.draft,imageSeriesStyle:item.visualStyle},item),
   batchId:item.batchId,photoIndex:item.photoIndex,batchCount:item.batchCount};
  await change({imageQueue:remaining});await start(job,attachments);
- await generationTrace(job,'Gemini 이미지 요청 전달','request',{promptLength:job.prompt.length,attachmentCount:attachments.length,thumbnail:!!item.thumbnail});
+ await generationTrace(job,providerName(job)+' 이미지 요청 전달','request',{promptLength:job.prompt.length,attachmentCount:attachments.length,thumbnail:!!item.thumbnail});
 }
 async function imageData(candidate){
  if(candidate.data){validateImage(candidate.data);return candidate.data;}
@@ -159,16 +211,28 @@ function newGeneratedImages(images, image) {
 
 function ownsGeminiJob(job, msg, sender) {
  return busy(job) && job.id === msg.jobId && job.tabId === sender.tab?.id && sender.frameId === 0
-  && sender.url?.startsWith(geminiOrigin);
+  && sender.url?.startsWith(providerOrigin(job.provider));
 }
 async function reportArticleStage(msg, sender) {
  const {job} = await read();
- if (!ownsGeminiJob(job, msg, sender) || job.kind !== 'article') return {ignored:true};
+ if (!ownsGeminiJob(job, msg, sender)) return {ignored:true};
+ if (['composer-ready','composer-blocked','stale-prompt-replaced','submitted','submit-unconfirmed'].includes(msg.stage)) {
+  await generationTrace(job,providerName(job)+' · '+({
+   'composer-ready':'입력창 확인','composer-blocked':'기존 입력 보존','stale-prompt-replaced':'확장이 남긴 요청 교체',
+   submitted:'사이트 전송 확인','submit-unconfirmed':'사이트 전송 미확인'
+  })[msg.stage],msg.stage,{source:'ai-content'});
+  return {};
+ }
+ if(msg.stage==='composer-written' && /^[a-f0-9]{64}$/.test(msg.digest)){
+  await rememberComposer(providerName(job),msg.digest);
+  return {};
+ }
+ if(job.kind!=='article')return {ignored:true};
  const allowed = msg.stage === 'waiting' && job.stage === 'request'
   || msg.stage === 'collecting' && ['request','waiting'].includes(job.stage);
  if (allowed) {
   await change({job:{...job,stage:msg.stage}});
-  await generationTrace(job,msg.stage === 'waiting' ? 'Gemini 초안 응답 대기' : 'Gemini 초안 응답 수집',msg.stage,{source:'gemini-content'});
+  await generationTrace(job,msg.stage === 'waiting' ? providerName(job)+' 초안 응답 대기' : providerName(job)+' 초안 응답 수집',msg.stage,{source:'ai-content'});
  }
  return {};
 }
@@ -195,18 +259,25 @@ async function result(msg,sender){
   try {
    if (msg.error) throw Error(text(msg.error,1200));
    await change({job:{...job,stage:'saving'}});
-   await generationTrace(job,'Gemini 초안 응답 수신','parse',{responseLength:text(msg.text).length});
-   const draft = parseDraft(msg.text);
+   await generationTrace(job,providerName(job)+' 초안 응답 수신','parse',{responseLength:text(msg.text).length});
+   const parsed=parseDraft(msg.text);
+   const notes=reviewArticle(parsed,s.form);
+   if(notes.length && !job.revisions){
+     await start({...job,id:crypto.randomUUID(),started:now(),stage:'request',revisions:1,
+       prompt:articlePrompt(s.form,parsed,'다음 항목만 보완한 완성 JSON 전체를 반환하세요. '+notes.join(' / ').slice(0,4000))});
+     return {};
+   }
+   const draft=layoutArticle({...parsed,reviewNotes:notes});
    const images = s.images.map(x=>x.source==='upload'&&x.draftId===s.draft.id?{...x,draftId:draft.id}:x);
    await snapshot('생성 전 초안',s);
    await change({draft,images,job:{...job,status:'done',stage:'saved',ended:now()}});
-   await Promise.allSettled([snapshot('Gemini 초안 생성'), generationTrace(job,'Gemini 초안 저장 완료','saved',
+   await Promise.allSettled([snapshot('Gemini 초안 생성'), generationTrace(job,providerName(job)+' 초안 저장 완료','saved',
     {observedTextBlocks:draft.content.length,observedTags:draft.hashtags.length,plannedImages:draft.imagePrompts.length}), closeFinishedGemini(job)]);
   } catch (error) {
    const {job:latest} = await read();
-   await change({job:{...latest,status:'error',error:error.message,code:error.code,raw:text(msg.text),ended:now()}});
+   await change({job:{...latest,status:'error',error:error.message,code:error.code,raw:text(msg.text),blockedComposerDigest:/^[a-f0-9]{64}$/.test(msg.blockedComposerDigest||'')?msg.blockedComposerDigest:undefined,ended:now()}});
    await releaseGeminiTab(job.tabId);
-   await generationTrace(job,'Gemini 초안 처리 실패',latest.stage,{code:error.code || 'DRAFT_RESULT_FAILED'});
+   await generationTrace(job,providerName(job)+' 초안 처리 실패',latest.stage,{code:error.code || (msg.responseProbe?'GPT_RESPONSE_UNREADABLE':'DRAFT_RESULT_FAILED'),...(msg.responseProbe?{replyFound:msg.responseProbe.sawReply===true,observedChars:Number(msg.responseProbe.observedChars)||0}:{} )});
   }
   return {};
  }
@@ -215,7 +286,7 @@ async function result(msg,sender){
   if(msg.error)throw Error(text(msg.error,1200));
    if(s.draft.id!==job.draftId)throw Error('초안이 바뀌어 이미지 결과를 적용하지 않았습니다.');
    const candidate=msg.images?.[0];if(!candidate)throw Error('생성된 이미지 파일을 찾지 못했습니다. Gemini에서 내려받은 사진을 직접 선택해주세요.');
-   await generationTrace(job,'Gemini 이미지 응답 수신','collect',{observedPhotos:msg.images.length});
+   await generationTrace(job,providerName(job)+' 이미지 응답 수신','collect',{observedPhotos:msg.images.length});
    const id=crypto.randomUUID();
    const original=await imageData(candidate);
    const overlayText = imageOverlayText(job.item.overlayText) || (job.item.thumbnail ? thumbnailOverlayText(s.draft) : '');
@@ -223,21 +294,33 @@ async function result(msg,sender){
    imageStage = 'save-image';
    const info=await putAsset(id,original);
    const image={id,...info,name:`2026-11-19-gemini-${s.images.length+1}.${info.mime==='image/jpeg'?'jpg':info.mime==='image/webp'?'webp':'png'}`,source:'gemini',draftId:job.draftId,prompt:job.item.prompt,caption:job.item.label,alt:job.item.alt||'',visualStyle,afterBlockId:job.item.afterBlockId||'',afterParagraph:job.item.afterParagraph,...placementOf(job.item.placement),thumbnail:!!job.item.thumbnail,...(overlayText?{overlayText,overlaySource:'gemini'}:{}),at:now()};
-   await snapshot('이미지 추가 전',s);await change({draft:{...s.draft,imageSeriesStyle:visualStyle},images:newGeneratedImages(s.images,image),job:{...job,status:'done',ended:now()}});
-   await generationTrace(job,'Gemini 원본 이미지 저장 완료','saved',{bytes:info.size,mime:info.mime,thumbnail:image.thumbnail,overlayRequested:!!overlayText,visualStyle});
+   await snapshot('이미지 추가 전',s);await change({remainingImages:s.imageQueue.length?{draftId:s.draft.id,items:s.imageQueue}:null,draft:{...s.draft,imageSeriesStyle:visualStyle},images:newGeneratedImages(s.images,image),job:{...job,status:'done',ended:now()}});
+   await generationTrace(job,providerName(job)+' 원본 이미지 저장 완료','saved',{bytes:info.size,mime:info.mime,thumbnail:image.thumbnail,overlayRequested:!!overlayText,visualStyle});
    await snapshot('이미지 생성 결과');
    if (s.imageQueue.length) {
     imageStage = 'next-image';
     await nextImage();
    } else {
-    await generationTrace(job,'Gemini 이미지 배치 완료','batch-done',{verifiedPhotos:job.batchCount});
+    await generationTrace(job,providerName(job)+' 이미지 배치 완료','batch-done',{verifiedPhotos:job.batchCount});
     await closeFinishedGemini(job);
    }
  }catch(e){await change({job:{...job,status:'error',error:e.message,...(e.code?{code:e.code}:{}),raw:text(msg.text),ended:now()},imageQueue:[]});await releaseGeminiTab(job.tabId);
-  await generationTrace(job,'Gemini 이미지 처리 실패',imageStage,{code:e.code || 'IMAGE_RESULT_FAILED'});}
+  await generationTrace(job,providerName(job)+' 이미지 처리 실패',imageStage,{code:e.code || 'IMAGE_RESULT_FAILED'});}
  return {};
 }
 async function command(msg,sender){
+ if(msg.type==='BUJA_READ_CODE'){
+  const {job}=await read();
+  if(!ownsGeminiJob(job,msg,sender)||job.provider!=='ChatGPT'||job.kind!=='article'||sender.frameId!==0)return {};
+  const [entry]=await chrome.scripting.executeScript({target:{tabId:job.tabId,frameIds:[0]},world:'MAIN',args:[job.id],func:id=>{
+   const node=document.querySelector('.cm-content[data-buja-response="'+CSS.escape(id)+'"]');
+   if(!node || node.closest('[data-message-author-role=user],[data-turn=user],form'))return '';
+   const view=node.cmTile?.root?.view || node.cmView?.view || node.cmView?.rootView?.view;
+   const doc=view?.state?.doc;
+   return doc && doc.length<=60000 ? doc.toString() : '';
+  }});
+  return {raw:typeof entry?.result==='string'?entry.result:''};
+ }
  if(msg.type==='BUJA_RESULT')return result(msg,sender);
  if(msg.type==='BUJA_STAGE')return reportArticleStage(msg,sender);
  if(/^THREAD_/.test(msg.type)){
@@ -275,7 +358,20 @@ async function command(msg,sender){
  switch(msg.type){
  case 'STATE':return {...s,connection:await connectionFor(msg.windowId),transfer:await recoverTransfer(msg.windowId)};
  case 'ONBOARD':await change({onboarded:true});return {};
- case 'SAVE':{if(msg.form)await change({form:formOf(msg.form)});if(msg.draft){if(busy(s.job))throw Error('생성 중에는 초안 편집을 기다려주세요.');await change({draft:draftOf({...msg.draft,id:s.draft.id,imageSeriesStyle:s.draft.imageSeriesStyle})});}return {};}
+ case 'SAVE_PREFS':{
+  const form=formOf(msg.form);
+  const keys=['textAI','imageAI','tone','length','articleType','preset','accent','imageType','imageCount','ratio'];
+  await chrome.storage.local.set({profilePreferences:Object.fromEntries(keys.map(key=>[key,form[key]]))});return {};
+ }
+ case 'RESTORE_PREFS':{
+  const {profilePreferences}=await chrome.storage.local.get('profilePreferences');
+  if(profilePreferences&&!busy(s.job))await change({form:formOf({...s.form,...profilePreferences})});return {};
+ }
+ case 'RESUME_IMAGES':{
+  if(busy(s.job)||s.remainingImages?.draftId!==s.draft.id||!s.remainingImages?.items?.length)throw Error('이어갈 이미지 작업이 없습니다.');
+  await beginImages(s.remainingImages.items);return {};
+ }
+ case 'SAVE':{if(msg.form)await change({form:formOf(msg.form)});if(msg.draft){if(msg.draft.id && msg.draft.id!==s.draft.id)throw Error('초안이 변경됐습니다. 패널을 다시 열어주세요.');if(busy(s.job))throw Error('생성 중에는 초안 편집을 기다려주세요.');await change({draft:draftOf({...msg.draft,id:s.draft.id,imageSeriesStyle:s.draft.imageSeriesStyle})});}return {};}
  case 'APPLY_MANUAL':{if(busy(s.job))throw Error('생성을 먼저 중단해주세요.');const draft=parseDraft(msg.text);await snapshot('직접 붙여넣기 전',s);await change({draft,images:s.images.map(x=>x.source==='upload'&&x.draftId===s.draft.id?{...x,draftId:draft.id}:x)});await snapshot('직접 붙여넣은 초안');await log('응답 직접 적용');return {};}
  case 'OPEN_SITE':{
   const sites = { threads:'https://www.threads.com/', naver:'https://blog.naver.com/', cafe:'https://section.cafe.naver.com/', tistory:'https://www.tistory.com/' };
@@ -287,6 +383,13 @@ async function command(msg,sender){
   return connection;
  }
  case 'DISCONNECT':await disconnectEditor(msg.windowId);await log('탭 연결 해제');return {};
+ case 'INSERT_GALLERY_PHOTO':{
+  const image=s.images.find(item=>item.id===msg.id);
+  if(!image)throw Error('갤러리에서 사진을 다시 선택해 주세요.');
+  await insertGalleryPhoto(msg.windowId,image);
+  await log('갤러리 사진 수동 삽입',image.caption || image.name);
+  return {};
+ }
  case 'FOCUS_CONNECTED':await focusConnected(msg.windowId);return {};
  case 'TRANSFER':
  case 'RETRY_TRANSFER':{
@@ -341,6 +444,12 @@ async function command(msg,sender){
   const images=s.images.map(x=>x.id===msg.id?{...x,caption:text(msg.caption,1000),prompt:text(msg.prompt,3000),...position,...(msg.adopt?{draftId:s.draft.id}:{})}:x);await change({images});return {};
  }
  case 'REMOVE_IMAGE':if(busy(s.job))throw Error('생성 중입니다.');await snapshot('사진 제거 전',s);await change({images:s.images.filter(x=>x.id!==msg.id)});await log('갤러리 사진 제거','원본은 복원용으로 보관했습니다.');return {};
+ case 'CLEAR_DRAFT':{
+  if(busy(s.job)||msg.draftId!==s.draft.id)throw Error('현재 작업과 초안을 다시 확인해주세요.');
+  await clearDraftTransfers(s.draft.id,msg.windowId);
+  await snapshot('기존 초안 지우기 전',s);
+  await change({draft:draftOf(),job:null,remainingImages:null,imageQueue:[]});return {};
+ }
  case 'CLEAR_IMAGES':if(busy(s.job))throw Error('생성 중입니다.');await snapshot('갤러리 비우기 전',s);await change({images:[],draft:{...s.draft,imageSeriesStyle:''}});return {};
  case 'SNAPSHOT':await snapshot('사용자 보관');await log('초안·사진 보관');return {};
  case 'RESTORE':{if(busy(s.job))throw Error('생성을 먼저 중단해주세요.');const h=s.history.find(x=>x.id===msg.id);if(!h)throw Error('기록이 없습니다.');await snapshot('복원 전',s);await change({form:h.form,draft:h.draft,images:h.images||[],reference:h.reference||null});await log('작업 기록 복원',h.at);return {};}
@@ -409,7 +518,38 @@ chrome.tabs.onUpdated.addListener((id,info)=>{
 chrome.tabs.onRemoved.addListener(id=>{void serial(async()=>{
  await chrome.storage.session.remove('threads-dismiss:'+id);
   await invalidateEditor(id,'연결된 글쓰기 탭이 닫혔습니다.');
- const s=await read();if(busy(s.job)&&s.job.tabId===id){await change({job:{...s.job,status:'error',error:'Gemini 탭이 닫혔습니다.'},imageQueue:[]});await log('생성 연결 끊김');}
+ const s=await read();if(busy(s.job)&&s.job.tabId===id){await change({job:{...s.job,status:'error',error:providerName(s.job)+' 작업 탭이 닫혔습니다.'},imageQueue:[]});await generationTrace(s.job,providerName(s.job)+' 작업 탭 닫힘',s.job.stage,{code:'AI_TAB_CLOSED'});}
 });});
 chrome.windows.onRemoved.addListener(id => { void serial(() => disconnectEditor(id)); });
-chrome.alarms.onAlarm.addListener(a=>{if(a.name!=='buja-watchdog')return;void serial(async()=>{const s=await read();if(!busy(s.job))return;let error='';if(Date.now()-Date.parse(s.job.started)>=(s.job.kind==='image'?330000:210000))error='응답 대기 시간이 초과되었습니다. Gemini 결과를 직접 확인해주세요.';else try{const p=await chrome.tabs.sendMessage(s.job.tabId,{type:'BUJA_PING'});if(p.running!==s.job.id)error='Gemini 탭이 이동되어 수집을 이어갈 수 없습니다.';}catch{error='Gemini 연결이 끊어졌습니다.';}if(error){await change({job:{...s.job,status:'error',error},imageQueue:[]});await releaseGeminiTab(s.job.tabId);await log('수집 중단',error);}});});
+async function checkGeneration() {
+ const {job} = await read();
+ if (!busy(job) || !Number.isInteger(job.tabId)) return;
+ const provider = providerName(job);
+ const tab = await chrome.tabs.get(job.tabId).catch(() => null);
+ const timedOut = Date.now() - Date.parse(job.started) >= (job.kind === 'image' ? 330000 : 210000);
+ let code = '';
+ let error = '';
+ if (!tab) {
+  code = 'AI_TAB_CLOSED';
+  error = provider + ' 작업 탭이 닫혔습니다.';
+ } else if (tab.status === 'complete' && tab.url && !tab.url.startsWith(providerOrigin(provider))) {
+  code = 'AI_TAB_LEFT_PROVIDER';
+  error = provider + ' 작업 탭이 다른 사이트로 이동했습니다.';
+ } else if (timedOut) {
+  code = 'AI_RESPONSE_TIMEOUT';
+  error = provider + ' 응답 수집 시간이 초과되었습니다. 열린 창에서 결과를 확인해주세요.';
+ }
+ if (error) {
+  await change({job:{...job,status:'error',code,error,ended:now()},imageQueue:[]});
+  await releaseGeminiTab(job.tabId);
+  await generationTrace(job,provider+' 수집 중단',job.stage,{code});
+  return;
+ }
+ const ping = await chrome.tabs.sendMessage(job.tabId,{type:'BUJA_PING'},{frameId:0}).catch(() => null);
+ if (ping?.running !== job.id && ping?.reporting !== job.id) {
+  await generationTrace(job,provider+' 수집기 재확인 대기',job.stage,{code:'AI_COLLECTOR_PENDING'});
+ }
+}
+chrome.alarms.onAlarm.addListener(alarm => {
+ if (alarm.name === 'buja-watchdog') void serial(checkGeneration);
+});

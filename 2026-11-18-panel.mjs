@@ -15,13 +15,13 @@ const { id: panelWindowId } = await chrome.windows.getCurrent();
 const api=async(type,extra={})=>{const r=await chrome.runtime.sendMessage({type,windowId:panelWindowId,...extra});if(!r?.ok)throw Object.assign(Error(r?.error||'확장 프로그램 연결을 확인해주세요.'),{code:r?.code});return r.data;};
 const notice=(s,error=false)=>{$('notice').hidden=false;$('notice').classList.toggle('error',error);$('notice').textContent=s;};
 function showDraftError(message, code) {
-  $('draftErrorTitle').textContent = code === 'GEMINI_CONNECTION' ? 'Gemini 연결 실패' : '초안 응답 확인';
+  $('draftErrorTitle').textContent = (code === 'GEMINI_CONNECTION' || code?.startsWith('AI_')) ? 'AI 연결 실패' : '초안 응답 확인';
   $('draftErrorMessage').textContent = message;
   if (!$('draftErrorDialog').open) $('draftErrorDialog').showModal();
 }
 const act=async fn=>{try{await fn();}catch(e){
   notice(e.message,true);
-  if (e.code === 'GEMINI_CONNECTION' || e.code === 'DRAFT_RESPONSE') showDraftError(e.message,e.code);
+  if (e.code === 'GEMINI_CONNECTION' || e.code?.startsWith('AI_') || e.code === 'DRAFT_RESPONSE') showDraftError(e.message,e.code);
 }};
 const click=(id,fn)=>$(id).addEventListener('click',()=>act(fn));
 for (const key of ['tone','length','articleType','preset','ratio','imageType']) {
@@ -44,7 +44,7 @@ for(const radio of radios) radio.onchange=()=>{
 };
 $('imageType').addEventListener('input',renderRatioDefault);
 const getForm=()=>formOf(Object.fromEntries(keys.map(k=>[k,$(k).type==='checkbox'?$(k).checked:$(k).value])));
-const getDraft=()=>draftOf({...state?.draft,title:$('draftTitle').value,summary:$('summary').value,hashtags:$('hashtags').value.split(/\s+/).filter(Boolean),body:$('draftBody').value,content:workingContent});
+const getDraft=()=>draftOf({...state?.draft,thumbnailText:state?.draft?.title===$('draftTitle').value?state.draft.thumbnailText:'',title:$('draftTitle').value,summary:$('summary').value,hashtags:$('hashtags').value.split(/\s+/).filter(Boolean),body:$('draftBody').value,content:workingContent});
 function fillForm(f){f=formOf(f);for(const k of keys){if($(k).type==='checkbox')$(k).checked=!!f[k];else $(k).value=f[k];}sourceView();renderRatioDefault();}
 function fillDraft(d) {
   $('draftTitle').value = d.title;
@@ -105,6 +105,9 @@ function renderPreview() {
   $('preview').innerHTML = draft.title || draft.body
     ? htmlOf(draft, getForm(), { preview: true, platform })
     : '<p class="empty">생성한 초안이 여기에 표시됩니다. 수정하기에서 직접 작성할 수도 있습니다.</p>';
+  const review=$('draftReview');
+  review.hidden=!draft.reviewNotes.length;
+  review.textContent=draft.reviewNotes.length?'초안 검토 필요 · '+draft.reviewNotes.join(' / '):'';
   $('jsonPreview').textContent = JSON.stringify({
     ...draft,
     images: state.images.map(image => ({
@@ -143,12 +146,12 @@ function renderDraftProgress() {
   }
   if (status === 'done') draftProgress.percent = 100;
   const labels = {
-    connecting: 'Gemini 창 연결', preparing: 'Gemini 창 연결',
+    connecting: 'AI 창 연결', preparing: 'AI 창 연결',
     done: '초안 저장 완료', error: '초안 작성 중단 · 오류 확인', cancelled: '초안 수집 중단'
   };
   const stageLabels = {
-    request: 'Gemini 요청 전달 중', waiting: '요청 전달 완료 · 응답 대기',
-    collecting: 'Gemini 응답 수집 중', saving: '초안 확인 및 저장 중'
+    request: 'AI 요청 전달 중', waiting: '요청 전달 완료 · 응답 대기',
+    collecting: 'AI 응답 수집 중', saving: '초안 확인 및 저장 중'
   };
   const description = labels[status] || stageLabels[stage];
   const label = $('draftProgressLabel');
@@ -168,10 +171,16 @@ function renderDraftProgress() {
   }
 }
 
-function renderJob(){renderDraftProgress();const running=pending||draftProgress?.status==='connecting'||busy(state?.job)||transferring;for(const id of ['generate','revise','generateImages','applyManual','draftTitle','draftBody','summary','hashtags','photoFiles','referenceFile','import','clearImages'])$(id).disabled=!!running;for(const e of document.querySelectorAll('#gallery button,#gallery input,#gallery textarea'))e.disabled=!!running;
+function renderJob(){renderDraftProgress();const running=pending||draftProgress?.status==='connecting'||busy(state?.job)||transferring;for(const id of ['generate','revise','generateImages','applyManual','draftTitle','draftBody','summary','hashtags','photoFiles','referenceFile','import','clearImages','clearDraft'])$(id).disabled=!!running;for(const e of document.querySelectorAll('#gallery button,#gallery input,#gallery textarea'))e.disabled=!!running;
  for(const field of document.querySelectorAll('#blockFields textarea,#gallery select')) field.disabled=running||transferring;
+ const imageJob=state?.job?.kind==='image';
+ $('stopImages').hidden=!imageJob || !busy(state.job);
+ $('resumeImages').hidden=busy(state?.job) || state?.remainingImages?.draftId!==state?.draft?.id || !state?.remainingImages?.items?.length;
+ $('imageFeedback').textContent=imageJob && ['error','cancelled'].includes(state.job.status) ? state.job.error || '확장의 수집과 대기열을 중지했습니다. 사이트의 생성 상태는 열린 창에서 확인하세요.' : '';
+ $('recoverComposer').hidden=!(state?.job?.kind==='article' && state.job.status==='error' && state.job.blockedComposerDigest);
+ $('recoverComposer').disabled=!!running;
  $('cancel').hidden=!busy(state?.job);const j=state?.job;
- $('jobState').textContent=j?.status==='running'?`${j.kind==='image'?'이미지 응답을 기다립니다.':'초안 진행 단계는 상단에서 확인할 수 있습니다.'}${state.imageQueue.length?` 남은 이미지 ${state.imageQueue.length}장.`:''}`:pending||j?.status==='preparing'?'Gemini 탭을 준비하고 입력창을 확인하는 중입니다.':j?.status==='error'?j.error:j?.status==='cancelled'?'수집을 중단했습니다. Gemini 자체 생성은 해당 화면에서 중지할 수 있습니다.':j?.status==='done'?'결과를 가져왔습니다. 내용을 확인해주세요.':'주제와 조건을 입력하면 시작할 수 있습니다.';
+ $('jobState').textContent=j?.status==='running'?`${j.kind==='image'?'이미지 응답을 기다립니다.':'초안 진행 단계는 상단에서 확인할 수 있습니다.'}${state.imageQueue.length?` 남은 이미지 ${state.imageQueue.length}장.`:''}`:pending||j?.status==='preparing'?'AI 탭을 준비하고 입력창을 확인하는 중입니다.':j?.status==='error'?j.error:j?.status==='cancelled'?'수집을 중단했습니다. AI 자체 생성은 해당 화면에서 중지할 수 있습니다.':j?.status==='done'?'결과를 가져왔습니다. 내용을 확인해주세요.':'주제와 조건을 입력하면 시작할 수 있습니다.';
  $('referenceName').textContent=state?.reference?`참고 사진: ${state.reference.name}`:'선택된 참고 사진 없음';
  const seriesStyle = state?.draft?.imageSeriesStyle;
  for(const radio of radios){radio.checked=radio.value===(seriesStyle || $('imageType').value);radio.disabled=Boolean(running || seriesStyle)}
@@ -243,7 +252,7 @@ function diagnosticReport() {
  return [...header,'',...entries.map(log=>`${log.at} · ${log.event}\n${diagnosticDetails(log)}\n`),
   ...(entries.length ? [] : ['아직 상세 진단 기록이 없습니다.'])].join('\n');
 }
-async function sync(fill=false){state=await api('STATE');if(fill){fillForm(state.form);fillDraft(state.draft);$('repo').value=state.settings.repo;}renderConnection();renderJob();renderHistory();renderLogs();await renderGallery();renderPreview();}
+async function sync(fill=false){const next=await api('STATE');const {job}=await chrome.storage.local.get('job');state={...next,job:job??next.job};if(fill){fillForm(state.form);fillDraft(state.draft);$('repo').value=state.settings.repo;}renderConnection();renderJob();renderHistory();renderLogs();await renderGallery();renderPreview();}
 function persist(){if(!state)return Promise.resolve();const revision=editRevision,form=getForm(),draft=busy(state.job)||pending?null:getDraft();const next=saves.catch(()=>{}).then(()=>api('SAVE',{form,...(draft?{draft}:{})}));saves=next;return next.then(()=>{savedRevision=Math.max(revision,savedRevision);$('saveState').textContent='현재 입력과 초안을 자동 저장했습니다.';},e=>{$('saveState').textContent='저장 실패: '+e.message;throw e;});}
 async function flush(){clearTimeout(timer);await persist();}
 function changedDraft(){editRevision++;sourceView();renderPreview();clearTimeout(timer);$('saveState').textContent='저장 중…';timer=setTimeout(()=>act(persist),450);}
@@ -257,7 +266,7 @@ async function renderGallery(){
  urls.forEach(url=>URL.revokeObjectURL(url));urls=[];previews.clear();gallery.replaceChildren();
  if(!state.images.length){
   const empty=document.createElement('p');empty.className='hint gallery-empty';
-  empty.textContent='사진 파일을 추가하거나 Gemini 이미지를 생성해주세요.';
+  empty.textContent='사진 파일을 추가하거나 AI 이미지를 생성해주세요.';
   gallery.append(empty);return;
  }
  const blocks=blocksOf(getDraft()).filter(block=>textOfBlock(block).trim());
@@ -324,11 +333,19 @@ async function renderGallery(){
    await sync();
  };
  button('설정 저장',()=>save());
- if (isThumbnail && image.overlaySource !== 'gemini' && state.draft.title) button('Gemini로 썸네일 다시 만들기',async()=>{
+ if (isThumbnail && image.overlaySource !== 'gemini' && state.draft.title) button('AI로 썸네일 다시 만들기',async()=>{
   await flush();
   await api('REGENERATE_IMAGE',{id:image.id,request:'현재 글의 핵심을 보여 주는 썸네일 장면과 한글 제목을 새로 완성해주세요.'});
   await sync();
-  notice('Gemini에 한글 문구가 들어간 썸네일을 요청했습니다.');
+  notice('AI에 한글 문구가 들어간 썸네일을 요청했습니다.');
+ },quick);
+ const insertButton=button('본문에 삽입',async()=>{
+   insertButton.disabled=true;
+   try{
+     await api('INSERT_GALLERY_PHOTO',{id:image.id});
+     insertButton.textContent='삽입 완료';
+     notice('선택한 사진을 본문에 삽입했습니다.'+(image.source==='gemini'?' 해당 사진의 AI 활용 설정을 확인해 주세요.':''));
+   }finally{insertButton.disabled=false;}
  },quick);
  button('파일 교체',async()=>{const picker=document.createElement('input');picker.type='file';picker.accept='image/png,image/jpeg,image/webp';picker.onchange=()=>act(async()=>{if(!picker.files[0])return;await save();await upload(picker.files[0],false,image.id);});picker.click();},quick);
  const copyPrompt=()=>{
@@ -372,7 +389,7 @@ click('installGuide',async()=>{
 click('manageExtensions',()=>chrome.tabs.create({url:'chrome://extensions/'}));
 click('help',()=>$('helpDialog').showModal());for(const id of ['helpDone','closeHelp'])click(id,async()=>{$('helpDialog').close();await api('ONBOARD');});
 $('helpDialog').addEventListener('cancel',()=>{void api('ONBOARD');});
-async function generate(revision='') {
+async function generate(revision='',recoverJobId) {
   if (!state || pending || draftProgress?.status === 'connecting' || busy(state.job) || transferring) return;
   draftProgress = {status: 'connecting', started: Date.now(), percent: 1, previousId: state.job?.id};
   renderJob();
@@ -382,9 +399,9 @@ async function generate(revision='') {
     if (revision && !getDraft().body.trim()) throw Error('수정할 초안을 준비해주세요.');
     pending = true;
     renderConnection();
-    const request = await api('GENERATE',{form:getForm(),revision});
+    const request = await api('GENERATE',{form:getForm(),revision,recoverJobId});
     draftProgress.jobId = request.jobId;
-    notice('Gemini에 초안 생성을 요청했습니다.');
+    notice('AI에 초안 생성을 요청했습니다.');
     await sync();
   } catch (error) {
     draftProgress.status = 'error';
@@ -396,8 +413,19 @@ async function generate(revision='') {
   }
 }
 $('brief').addEventListener('submit',e=>{e.preventDefault();void act(()=>generate());});click('revise',async()=>{if(!$('revision').value.trim())throw Error('수정 요청을 입력해주세요.');await generate($('revision').value);});
+click('recoverComposer',async()=>{
+  if(!confirm('작업 창의 현재 입력을 확인하셨나요? 해당 입력을 지우고 초안을 작성합니다.'))return;
+  await generate('',state.job.id);
+});
+click('stopImages',async()=>{await api('CANCEL');await sync();});
+click('resumeImages',async()=>{await flush();await api('RESUME_IMAGES');await sync();});
+click('savePrefs',async()=>{await flush();await api('SAVE_PREFS',{form:getForm()});notice('이 Chrome 프로필에 현재 설정을 저장했습니다.');});
 click('generateImages',async()=>{await flush();await api('GENERATE_IMAGES');await sync();notice('최신 초안으로 이미지 생성을 시작했습니다.');});
-click('cancel',async()=>{await api('CANCEL');await sync();notice('수집을 중단했습니다. Gemini 생성 자체는 해당 화면에서 중지해주세요.');});
+click('cancel',async()=>{await api('CANCEL');await sync();notice('수집을 중단했습니다. AI 생성 자체는 해당 화면에서 중지해주세요.');});
+click('clearDraft',async()=>{
+ if(!confirm('현재 초안의 제목·본문·태그와 전송 기록을 지울까요? 이미지 갤러리와 이미 입력한 네이버 글은 보존됩니다.'))return;
+ await flush();await api('CLEAR_DRAFT',{draftId:state.draft.id});$('revision').value='';$('draftEditor').hidden=true;await sync(true);notice('기존 초안을 지웠습니다.');
+});
 click('editDraft',()=>{$('draftEditor').hidden=!$('draftEditor').hidden;});click('closeEdit',async()=>{await flush();$('draftEditor').hidden=true;await renderGallery();notice('초안 수정을 저장했습니다.');});
 click('resetAccent',()=>{$('accent').value='#08796b';renderPreview();void act(flush);});
 click('save',async()=>{await flush();await api('SNAPSHOT');await sync();notice('현재 초안과 사진을 History에 보관했습니다.');});
@@ -490,10 +518,15 @@ chrome.storage.onChanged.addListener((changes,area)=>{
   if (changes.draft) state.draft=changes.draft.newValue;
   const job = changes.job?.newValue;
   const generated = job?.kind === 'article' && job.status === 'done';
-  if (generated) fillDraft(state.draft);
+  const changedDraft=changes.draft && changes.draft.oldValue?.id!==changes.draft.newValue?.id;
+  if(changedDraft && !state.draft.title && !state.draft.body && !state.job){
+   clearInterval(draftProgressTimer);draftProgressTimer=undefined;draftProgress=undefined;
+   $('draftProgress').hidden=true;
+  }
+  if (generated || changedDraft) fillDraft(state.draft);
   renderJob();
   renderConnection();
-  if (changes.images || generated) {
+  if (changes.images || generated || changedDraft) {
     renderPreview();
     void act(renderGallery);
   }
@@ -506,4 +539,4 @@ chrome.storage.onChanged.addListener((changes,area)=>{
   }
 });
 window.addEventListener('pagehide',()=>{clearTimeout(timer);clearInterval(draftProgressTimer);if(editRevision!==savedRevision)void persist().catch(()=>{});urls.forEach(x=>URL.revokeObjectURL(x));});
-await act(async()=>{await sync(true);if(!state.onboarded)$('helpDialog').showModal();});
+await act(async()=>{await api('RESTORE_PREFS');await sync(true);if(!state.onboarded)$('helpDialog').showModal();});

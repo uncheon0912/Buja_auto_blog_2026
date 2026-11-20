@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "부사연 슈퍼노바 SNS",
-  "version": "0.5.12",
+  "version": "0.5.24",
   "minimum_chrome_version": "116",
   "description": "부자사람연구소에서 만든 SNS 글쓰기 도구입니다. AI로 글과 이미지를 만들고 블로그와 Threads 작성창에 넣을 수 있습니다.",
   "permissions": [
@@ -19,7 +19,8 @@
     "https://threads.com/*",
     "https://www.threads.com/*",
     "https://threads.net/*",
-    "https://www.threads.net/*"
+    "https://www.threads.net/*",
+    "https://chatgpt.com/*"
   ],
   "optional_host_permissions": [
     "https://api.github.com/*",
@@ -50,7 +51,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://gemini.google.com/*"
+        "https://gemini.google.com/*",
+        "https://chatgpt.com/*"
       ],
       "js": [
         "2026-11-18-gemini.js"
@@ -72,5 +74,20 @@
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "2026-11-18-studio-scene.mjs",
+        "2026-11-18-three.module.js",
+        "2026-11-18-three.core.js"
+      ],
+      "matches": [
+        "https://threads.com/*",
+        "https://www.threads.com/*",
+        "https://threads.net/*",
+        "https://www.threads.net/*"
+      ]
+    }
+  ]
 }

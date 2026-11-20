@@ -15,6 +15,13 @@ export async function transferFor(windowId) {
 
 const activeTransfers = new Set();
 
+export async function clearDraftTransfers(draftId,windowId){
+  if(activeTransfers.size)throw Error('전송이 끝난 뒤 초안을 지워주세요.');
+  const values=await chrome.storage.session.get(null);
+  const keys=Object.keys(values).filter(key=>key.startsWith('transfer:') && (values[key]?.draftId===draftId || (key===transferKey(windowId) && !values[key]?.draftId)));
+  if(keys.length)await chrome.storage.session.remove(keys);
+}
+
 export async function recoverTransfer(windowId) {
   const previous = await transferFor(windowId);
   if (previous?.status !== 'running' || activeTransfers.has(windowId)) return previous;
@@ -92,6 +99,17 @@ async function getConnected(windowId) {
   return { connection, probe };
 }
 
+export async function insertGalleryPhoto(windowId,image){
+  if(activeTransfers.has(windowId)) throw Error('자동 전송이 끝난 뒤 삽입해 주세요.');
+  activeTransfers.add(windowId);
+  try {
+    const {connection}=await getConnected(windowId);
+    if(connection.platform!=='naver') throw Error('네이버 블로그 글쓰기 탭을 연결해 주세요.');
+    const result=await invoke(connection,'manualPhoto',{image:{name:image.name,data:await getData(image.id)}});
+    if(result.status!=='ok') throw Error(result.message || '편집기에서 사진을 확인해 주세요.');
+  } finally {activeTransfers.delete(windowId);}
+}
+
 export async function focusConnected(windowId) {
   const { connection } = await getConnected(windowId);
   await chrome.tabs.update(connection.tabId, { active: true });
@@ -137,7 +155,7 @@ export function buildTransferPlan(draft, form, photos, platform) {
   const naver = platform === 'naver';
   const tagCandidates = [...(draft.hashtags || []), ...(form.keywords || '').split(/[,\n]+/)];
   const tags = naver ? [...new Set(tagCandidates.map(tag =>
-    tag.normalize('NFC').replace(/[^\p{L}\p{N}_]/gu, '')).filter(Boolean))].slice(0, 7) : [];
+    tag.normalize('NFC').replace(/[^\p{L}\p{N}_]/gu, '')).filter(Boolean))].slice(0, 8) : [];
   const tagLine = tags.map(tag => '#' + tag).join(' ');
   const tagBlock = tagLine ? { type: 'paragraph', text: tagLine } : null;
   const indexes = new Map(blocks.map((block, index) => [block.id, index]));
@@ -151,7 +169,7 @@ export function buildTransferPlan(draft, form, photos, platform) {
   if (!title || !blocks.length) throw Error('제목과 본문을 먼저 작성해주세요.');
   const accent = /^#[0-9a-f]{6}$/i.test(form.accent) ? form.accent : '#08796b';
   const steps = [...blocks, ...(tagBlock ? [tagBlock] : [])].map(block => ({
-    text: textOfBlock(block), html: renderBlock(block, accent, false, naver), format: boundary(block, true)
+    text: textOfBlock(block), html: naver && block.id?.startsWith('editorial-divider-') && block.text==='---' ? '<p>---</p>' : renderBlock(block, accent, false, naver), format: boundary(block, true)
   }));
   const sequence = [];
   const images = [];
@@ -254,7 +272,7 @@ async function runTransfer(windowId, { draft, form, images }, retry, report, inc
     throw Error('초안이나 편집기가 바뀌었습니다. 현재 편집기를 확인해주세요.');
   }
   const progress = retry ? { ...previous, status: 'running' } : {
-    id, fingerprint, documentId: connection.documentId, status: 'running',
+    id, draftId:draft.id, fingerprint, documentId: connection.documentId, status: 'running',
     completed: 0, cursor: 0, total: photos.length, titleDone: false, textDone: 0, thumbnailDone: false,
     bodyDone: false, formatWarnings: []
   };
@@ -342,8 +360,16 @@ async function runTransfer(windowId, { draft, form, images }, retry, report, inc
         source:'editor.editorBridge',status:'ok',elapsedMs:Math.round(performance.now() - started),
         confirmedTextBlocks:progress.textDone,confirmedPhotos:progress.completed,formatWarnings:result.formatWarnings, ...result.diagnostic});
     }
+    const indices=plan.images.flatMap((photo,i)=>images.find(item=>item.id===photo.id)?.source==='gemini' ? [i] : []);
+    let manual=[];
+    if(connection.platform==='naver' && indices.length){
+      const result=await invoke(connection,'aiLabels',{transferId:id,indices}).catch(()=>null);
+      manual=result?.manual ?? indices.map(i=>i+1);
+      await record('AI 활용 설정 확인',{stage:'ai-labels',manualPhotos:manual});
+    }
+    const labelNotice=manual.length ? ' 사진 '+manual.join(', ')+'번의 AI 활용 설정을 직접 켜 주세요.' : '';
     const warning = progress.formatWarnings.length ? ' 일부 서식 유지 여부는 편집기에서 확인해주세요.' : '';
-    await update({ status: 'done', bodyDone: true, message: '제목·본문' + (progress.total ? '·사진 ' + progress.total + '장' : '') + '을 입력했습니다.' + warning });
+    await update({ status: 'done', bodyDone: true, message: '제목·본문' + (progress.total ? '·사진 ' + progress.total + '장' : '') + '을 입력했습니다.' + labelNotice + warning });
     await record('전송 최종 확인',{...target,stage:'final-verification',code:'TRANSFER_VERIFIED',source:'transfer.runTransfer',
       titleVerified:progress.titleDone,expectedTextBlocks:plan.blocks.length,verifiedTextBlocks:Math.min(progress.textDone,plan.blocks.length),
       expectedPhotos:plan.images.length,verifiedPhotos:progress.completed,loadedPhotosAtLastPhoto:progress.loadedPhotos ?? 0,expectedTags:plan.tagCount,

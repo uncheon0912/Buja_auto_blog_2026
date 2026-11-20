@@ -188,6 +188,15 @@ export async function editorBridge(mode, platform, payload = {}) {
   }
   const occupied = !!read(title) || !!bodyText() || photos().length > 0
     || !!container.querySelector('.se-component:not(.se-text):not(.se-documentTitle), iframe, video, table, figure');
+  const editorState = documents.get(container);
+  if (platform === 'naver' && !editorState.listen) {
+    editorState.listen = true;
+    document.addEventListener('pointerdown', event => {
+      if (!event.isTrusted) return;
+      const paragraph = event.target.closest?.('.se-component.se-text .se-text-paragraph,.se-section-text [contenteditable=true]');
+      editorState.clicked = container.contains(paragraph) ? paragraph : null;
+    }, true);
+  }
   if (mode === 'probe') return { found: true, occupied, token, sharedInput: !!sharedInput, inputPath, imageReady: !!upload() || !!photoToolbar() };
   if (payload.token !== token) return { status: 'review', message: '글쓰기 문서가 바뀌었습니다. 편집기를 확인해주세요.' };
 
@@ -543,7 +552,55 @@ export async function editorBridge(mode, platform, payload = {}) {
     }
   }
 
+  if (mode === 'manualPhoto') {
+    const paragraph = editorState.clicked;
+    const missing = '네이버 본문에서 사진을 넣을 위치를 다시 클릭해 주세요.';
+    if (!paragraph?.isConnected || !container.contains(paragraph)) return {message:missing};
+    const selection = bodyDoc.getSelection();
+    const buffer = sharedInput?.contentDocument?.body;
+    const range = selection?.rangeCount && selection.isCollapsed && paragraph.contains(selection.anchorNode)
+      ? selection.getRangeAt(0).cloneRange() : null;
+    if (!range && !(buffer && bodyDoc.activeElement === sharedInput)) return {message:missing};
+    const blob = await (await fetch(payload.image.data)).blob();
+    if (!paragraph.isConnected || editorState.clicked !== paragraph) return {message:missing};
+    const data = new DataTransfer();
+    data.items.add(new File([blob],payload.image.name,{type:blob.type}));
+    const before = photos().map(photoRecord);
+    if (!buffer && range) { selection.removeAllRanges(); selection.addRange(range); }
+    sendPaste(buffer || paragraph.closest('[contenteditable=true]') || paragraph,data);
+    editorState.clicked = null;
+    for (let i=0;i<100;i++) {
+      const current = photos();
+      if (current.length === before.length+1 && current.some((img,index) =>
+        img.complete && img.naturalWidth && current.filter((_,k)=>k!==index).every((old,k)=>photoRecord(old)===before[k]))) return {status:'ok'};
+      await sleep(120);
+    }
+    return {message:'사진 삽입을 확인하지 못했습니다. 다시 누르기 전에 편집기를 확인해 주세요.'};
+  }
   const operation = session.get(payload.transferId);
+  if (mode === 'aiLabels') {
+    const manual = [];
+    for (const index of payload.indices) {
+      const ref = operation?.insertedPhotos?.[index];
+      const matches = ref ? photos().filter(img=>img===ref.node || photoRecord(img)===ref.key) : [];
+      const img = matches.length===1 && matches[0];
+      const component = img && img.closest('.se-component,figure,.se-module-image');
+      let confirmed=false, clicked=false;
+      if(component) {
+        img.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));
+        for(let attempt=0;attempt<8;attempt++){
+          const label=[...component.querySelectorAll('label,button,[role=switch],[role=checkbox],input[type=checkbox]')].find(el=>/AI\s*활용\s*설정/i.test([el.textContent,el.title,el.getAttribute('aria-label')].join(' ')));
+          const toggle=label?.control || label?.querySelector('input[type=checkbox],[aria-checked],[aria-pressed]') || label;
+          const checked=toggle?.checked ?? toggle?.getAttribute('aria-checked') ?? toggle?.getAttribute('aria-pressed');
+          if(checked===true || checked==='true'){confirmed=true;break;}
+          if(!clicked && (checked===false || checked==='false')){clicked=true;toggle.click();}
+          await sleep(120);
+        }
+      }
+      if(!confirmed) manual.push(index+1);
+    }
+    return {manual};
+  }
   if(mode==='resume' && operation?.unknown && operation.pendingPhoto && operation.cursor===payload.cursor){
     operation.pendingPhoto();
   }
@@ -637,6 +694,7 @@ export async function editorBridge(mode, platform, payload = {}) {
   // Once the site receives the event, a timeout never proves the photo was absent.
   operation.unknown = true;
   dispatchPhoto();
+
   function verifyPendingPhoto(){
     photoAttempts++;
     if (!container.isConnected || !title.isConnected) return null;
@@ -670,6 +728,7 @@ export async function editorBridge(mode, platform, payload = {}) {
       return {status: 'review', message: '사진이 직전에 넣은 본문 뒤에 있는지 확인해주세요.',
         diagnostic:photoCheck('PHOTO_ORDER_MISMATCH',current,photoAttempts)};
     }
+    (operation.insertedPhotos ||= [])[payload.index] = {node:img, key:photoRecord(img)};
     delete operation.pendingPhoto;
     operation.next++;
     return finishStep({status: 'ok',diagnostic:photoCheck('PHOTO_VERIFIED',current,photoAttempts)});

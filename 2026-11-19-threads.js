@@ -16,12 +16,32 @@
   ui.innerHTML = `<style>
     *{box-sizing:border-box}section{font:15px/1.5 system-ui;color:#eaf5f2;background:#172425;border:1px solid #50726b;border-radius:16px;padding:16px;width:min(360px,94vw);max-height:78vh;overflow:auto;box-shadow:0 8px 30px #0004}
     button,textarea,select{font:inherit;border:1px solid #64918a;border-radius:8px;padding:8px}button{cursor:pointer;background:#b3ecdc;color:#152921;margin:4px 2px}button:disabled{opacity:.5}label,textarea,select{display:block;width:100%;margin:6px 0}textarea,select{background:#fff;color:#152921}img{width:70px;height:70px;object-fit:cover;margin:3px}[hidden]{display:none!important}
-  </style><section><header id="grip">부사연 슈퍼노바 SNS · Threads <small>이동</small></header><div id="offer">이 계정에 올릴 Threads 글을 준비할까요?<br><button id="yes">준비하기</button><button id="later">나중에</button></div>
+    section{color-scheme:dark;background:#171719;color:#f4f4f5;border-color:#414145;padding:16px;box-shadow:0 12px 36px #0006}
+    #grip{position:sticky;top:-16px;z-index:1;display:flex;align-items:center;gap:8px;margin:-16px -16px 14px;padding:10px 16px;background:#202022;border-bottom:1px solid #38383c;cursor:move;touch-action:none;user-select:none}
+    #mark{display:grid;place-items:center;width:36px;height:36px;color:#ccc}#mark canvas{width:100%;height:100%}
+    #dismiss{margin-left:auto;font-size:22px;line-height:1;padding:6px 10px}
+    label{color:#d8d8db;font-weight:600;margin-top:12px}textarea,select{background:#242427;color:#fafafa;border-color:#55555a;font-weight:400;padding:10px}
+    button{background:#303034;color:#eee;border-color:#505055;transition:background .15s,transform .15s}#draft,#insert,#yes,#images{background:#f4f4f5;color:#181818}
+    button:hover:enabled{filter:brightness(1.15);transform:translateY(-1px)}button:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid #c4c6ff;outline-offset:2px}
+    @media(prefers-reduced-motion:reduce){button{transition:none}button:hover:enabled{transform:none}}
+  </style><section><header id="grip"><span id="mark" aria-hidden="true">◎</span><strong>슈퍼노바 · Threads</strong><button id="dismiss" type="button" aria-label="패널 닫기" title="닫기">×</button></header><div id="offer">이 계정에 올릴 Threads 글을 준비할까요?<br><button id="yes">준비하기</button><button id="later">나중에</button></div>
   <button id="resume" hidden>Threads 글 준비</button><div id="work" hidden><label>주제와 요청<textarea id="topic" rows="2"></textarea></label><label>이미지 개수<select id="count"></select></label><label id="ratioField" hidden>이미지 비율<select id="ratio"><option value="1:1">1:1</option><option value="4:5">4:5</option><option value="3:4">3:4 (인스타 카드뉴스)</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label><label id="styleField" hidden>이미지 스타일<select id="style"></select></label><button id="draft">게시글과 프롬프트 생성</button><label>게시할 글<textarea rows="4" id="post"></textarea></label><div id="prompts"></div><button id="images" hidden>이미지 생성</button><div id="gallery"></div><button id="insert">Threads 작성창에 넣기</button><button id="fold">접기</button></div><div id="status" role="status"></div></section>`;
   const el = id => ui.getElementById(id);
   const box=ui.querySelector('section');
   const grip=el('grip');
-  grip.style.cssText='position:sticky;top:-16px;background:#172425;padding:8px;cursor:move;touch-action:none;user-select:none;z-index:1';
+  let scene,closed=false;
+  const motion=matchMedia('(prefers-reduced-motion: reduce)');
+  el('dismiss').onpointerdown=e=>e.stopPropagation();
+  el('dismiss').onclick=()=>{closed=true;observer.disconnect();scene?.dispose();host.remove();};
+  async function decorate(){
+    if(motion.matches)return;
+    try{
+     const {createStudioScene}=await import(chrome.runtime.getURL('2026-11-18-studio-scene.mjs'));
+     if(closed)return;
+     const mark=el('mark');scene=createStudioScene(mark,motion,matchMedia('(pointer:fine)'));
+     if(scene){mark.firstChild.remove();scene.render(true);}
+    }catch{}
+  }
   let anchored=false;
   function place(x,y,w,h){
     w=Math.min(innerWidth,Math.max(240,w));h=Math.min(innerHeight,Math.max(120,h));
@@ -65,7 +85,7 @@
       if(running)return;
       running=true;
       const controls=[...ui.querySelectorAll('button,textarea,select')];
-      controls.forEach(node=>node.disabled=true);
+      controls.filter(node=>node.id!=='dismiss').forEach(node=>node.disabled=true);
       try{await fn();}catch(error){status(error.message);}
       finally{running=false;controls.forEach(node=>node.disabled=false);}
     };
@@ -139,7 +159,7 @@
   function open(){el('offer').hidden=true;el('resume').hidden=true;el('work').hidden=false;}
   function fold(){el('offer').hidden=true;el('work').hidden=true;el('resume').hidden=false;}
   el('yes').onclick=open;el('resume').onclick=open;el('later').onclick=()=>{fold();void request({type:'THREAD_DISMISS'}).catch(()=>{});};el('fold').onclick=fold;
-  function mount(){if(!host.isConnected && (createButton()||editor()))document.body.append(host);}
+  function mount(){if(!closed && !host.isConnected && (createButton()||editor())){document.body.append(host);void decorate();}}
   request({type:'THREAD_PREF'}).then(hidden=>{if(hidden && !el('offer').hidden)fold();}).catch(()=>{});
   mount();const observer=new MutationObserver(()=>{if(!host.isConnected)mount();});
   observer.observe(document.body,{childList:true,subtree:true});

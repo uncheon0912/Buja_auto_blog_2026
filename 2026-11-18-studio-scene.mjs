@@ -98,5 +98,5 @@ export function createStudioScene(mark, reducedMotion, finePointer) {
   }
   canvas.addEventListener('webglcontextlost', dispose, { once: true });
   window.addEventListener('pagehide', event => { if (!event.persisted) dispose(); });
-  return { render };
+  return { render, dispose };
 }
