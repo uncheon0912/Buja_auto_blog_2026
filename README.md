@@ -8,11 +8,11 @@
 
 포함된 Three.js에는 [해당 구성요소의 라이선스](./2026-11-18-three-LICENSE.txt)가 적용됩니다.
 
-**현재 소스 버전 0.5.36** · [0.5.36 설치용 소스 ZIP](https://github.com/uncheon0912/Buja_auto_blog_2026/archive/refs/heads/main.zip) · [기존 버전별 배포 파일](https://github.com/uncheon0912/Buja_auto_blog_2026/releases)
+**현재 소스 버전 0.5.37** · [0.5.37 설치용 소스 ZIP](https://github.com/uncheon0912/Buja_auto_blog_2026/archive/refs/heads/main.zip) · [기존 버전별 배포 파일](https://github.com/uncheon0912/Buja_auto_blog_2026/releases)
 
 처음 설치하기
 
-1. 위의 0.5.36 설치용 소스 ZIP을 내려받으세요. 이전 버전이 필요하면 버전별 배포 파일에서 내려받을 수 있습니다.
+1. 위의 0.5.37 설치용 소스 ZIP을 내려받으세요. 이전 버전이 필요하면 버전별 배포 파일에서 내려받을 수 있습니다.
 2. ZIP의 압축을 풀고 계속 사용할 폴더에 보관하세요. 폴더를 열어 manifest.json이 보이는지 확인하세요.
 3. Chrome 주소창에 chrome://extensions 를 입력하고 오른쪽 위 ‘개발자 모드’를 켜세요.
 4. ‘압축해제된 확장 프로그램을 로드합니다’를 누르고 manifest.json이 들어 있는 폴더를 선택하세요.

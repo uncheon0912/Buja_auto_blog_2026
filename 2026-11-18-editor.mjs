@@ -190,13 +190,35 @@ export async function editorBridge(mode, platform, payload = {}) {
     || !!container.querySelector('.se-component:not(.se-text):not(.se-documentTitle), iframe, video, table, figure');
   const occupied = !!read(title) || bodyOccupied;
   const editorState = documents.get(container);
-  if (platform === 'naver' && !editorState.listen) {
+  if (!editorState.listen) {
     editorState.listen = true;
-    document.addEventListener('pointerdown', event => {
-      if (!event.isTrusted) return;
-      const paragraph = event.target.closest?.('.se-component.se-text .se-text-paragraph,.se-section-text [contenteditable=true]');
-      editorState.clicked = container.contains(paragraph) ? paragraph : null;
+    function paragraphAt(target) {
+      if (!target || !container.contains(target) || title.contains(target)) return null;
+      if (platform==='tistory') return body;
+      return target.closest?.('.se-component.se-text .se-text-paragraph,.se-section-text [contenteditable=true]') || null;
+    }
+    bodyDoc.addEventListener('pointerdown', event => {
+      if (event.isTrusted) editorState.clicked = paragraphAt(event.target);
     }, true);
+    const dragType='application/x-buja-gallery-photo';
+    bodyDoc.addEventListener('dragover', event => {
+      if (!event.isTrusted || !event.dataTransfer?.types.includes(dragType) || !paragraphAt(event.target)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect='copy';
+    },true);
+    bodyDoc.addEventListener('drop', event => {
+      if (!event.isTrusted || !event.dataTransfer?.types.includes(dragType)) return;
+      const paragraph=paragraphAt(event.target);
+      if (!paragraph) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const nonce=event.dataTransfer.getData(dragType);
+      if (!/^[0-9a-f-]{36}$/i.test(nonce)) return;
+      const range=bodyDoc.caretRangeFromPoint?.(event.clientX,event.clientY);
+      if (!range?.collapsed || !paragraph.contains(range.startContainer)) return;
+      editorState.drop={nonce,paragraph,range};
+      void chrome.runtime.sendMessage({type:'DROP_GALLERY_PHOTO',nonce}).catch(()=>{});
+    },true);
   }
   if (mode === 'probe') return { found: true, occupied, bodyOccupied, title:read(title), token, sharedInput: !!sharedInput, inputPath, imageReady: !!upload() || !!photoToolbar() };
   if (payload.token !== token) return { status: 'review', message: '글쓰기 문서가 바뀌었습니다. 편집기를 확인해주세요.' };
@@ -595,25 +617,42 @@ export async function editorBridge(mode, platform, payload = {}) {
   }
 
   if (mode === 'manualPhoto') {
-    const paragraph = editorState.clicked;
-    const missing = '네이버 본문에서 사진을 넣을 위치를 다시 클릭해 주세요.';
+    const drop=payload.dropNonce && editorState.drop?.nonce===payload.dropNonce ? editorState.drop : null;
+    if(payload.dropNonce && !drop)return {message:'본문 안에서 이미지를 놓을 위치를 확인해주세요.'};
+    const paragraph = drop?.paragraph || editorState.clicked;
+    const missing = '연결된 글쓰기창에서 사진을 넣을 본문 위치를 클릭해 주세요.';
     if (!paragraph?.isConnected || !container.contains(paragraph)) return {message:missing};
     const selection = bodyDoc.getSelection();
     const buffer = sharedInput?.contentDocument?.body;
-    const range = selection?.rangeCount && selection.isCollapsed && paragraph.contains(selection.anchorNode)
-      ? selection.getRangeAt(0).cloneRange() : null;
+    const range = drop?.range || (selection?.rangeCount && selection.isCollapsed && paragraph.contains(selection.anchorNode)
+      ? selection.getRangeAt(0).cloneRange() : null);
     if (!range && !(buffer && bodyDoc.activeElement === sharedInput)) return {message:missing};
+    const baseline=signature();
     const blob = await (await fetch(payload.image.data)).blob();
-    if (!paragraph.isConnected || editorState.clicked !== paragraph) return {message:missing};
+    if (signature()!==baseline || !paragraph.isConnected || (drop ? editorState.drop !== drop : editorState.clicked !== paragraph)
+      || (range && !paragraph.contains(range.startContainer))) return {message:missing};
     const data = new DataTransfer();
     data.items.add(new File([blob],payload.image.name,{type:blob.type}));
     const before = photos().map(photoRecord);
-    if (!buffer && range) { selection.removeAllRanges(); selection.addRange(range); }
+    const beforeBody=bodyText();
+    const beforeTitle=read(title);
+    if (drop && buffer) {
+      const rect=range.getBoundingClientRect();
+      const box=paragraph.getBoundingClientRect();
+      clickAt(paragraph,rect.height ? rect.left : box.left+3,rect.height ? rect.top + rect.height/2 : box.top+3);
+      if (bodyDoc.activeElement!==sharedInput || !paragraph.closest('.se-section-text')?.classList.contains('se-is-focused')) return {message:missing};
+    }
+    if (!buffer && range) {
+      (paragraph.closest('[contenteditable=true]') || paragraph).focus();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
     sendPaste(buffer || paragraph.closest('[contenteditable=true]') || paragraph,data);
     editorState.clicked = null;
+    if(drop)editorState.drop=null;
     for (let i=0;i<100;i++) {
       const current = photos();
-      if (current.length === before.length+1 && current.some((img,index) =>
+      if (beforeBody===bodyText() && beforeTitle===read(title) && current.length === before.length+1 && current.some((img,index) =>
         img.complete && img.naturalWidth && current.filter((_,k)=>k!==index).every((old,k)=>photoRecord(old)===before[k]))) return {status:'ok'};
       await sleep(120);
     }

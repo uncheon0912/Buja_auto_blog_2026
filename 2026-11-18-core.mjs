@@ -1,5 +1,5 @@
 import {normalizeContent, textOfBlock, blocksOf, photoPlacements, escape, renderBlock, shortHeading} from './2026-11-18-document.mjs';
-export const VERSION=globalThis.chrome?.runtime?.getManifest?.().version || '0.5.36';
+export const VERSION=globalThis.chrome?.runtime?.getManifest?.().version || '0.5.37';
 export const busy = job => !!job && ['running','preparing'].includes(job.status);
 export const DEFAULT_ACCENT = '#0078cb';
 export const text = (v, max=60000) => typeof v==='string' ? v.slice(0,max) : '';

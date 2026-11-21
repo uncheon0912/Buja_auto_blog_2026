@@ -6,4 +6,11 @@ export async function putAsset(id,data){const {bytes,mime}=validateImage(data);a
 export async function getBlob(id){const r=await transaction('readonly',s=>s.get(id));if(!r)throw Error('사진 원본이 없습니다. 파일을 다시 선택해주세요.');return r.blob;}
 export async function dataUrlOf(blob){const bytes=new Uint8Array(await blob.arrayBuffer());let binary='';for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));return `data:${blob.type};base64,${btoa(binary)}`;}
 export async function getData(id){return dataUrlOf(await getBlob(id));}
-// Assets are immutable. Removed/replaced originals remain in IndexedDB for History restoration.
+export async function deleteAssets(ids){
+ if(!ids.length)return;
+ await transaction('readwrite',store=>{
+  let last;
+  for(const id of ids)last=store.delete(id);
+  return last;
+ });
+}

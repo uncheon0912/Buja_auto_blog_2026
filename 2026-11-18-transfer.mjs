@@ -55,7 +55,6 @@ export async function connectEditor(windowId, tabId) {
     }
     throw Error(platformNames[platform] + ' 새 글쓰기창을 확인하지 못했습니다. 로그인과 제목·본문 입력창을 확인해주세요.');
   }
-  if (matches[0].result.occupied) throw Error('이미 내용이 들어 있는 글쓰기창입니다. 새 빈 글쓰기창을 열어주세요.');
   const current = await chrome.tabs.get(tabId).catch(() => null);
   if (!current?.active || current.windowId !== windowId || current.url !== tab.url) {
     throw Error('확인하는 동안 탭이 바뀌었습니다. 연결 버튼을 다시 눌러주세요.');
@@ -100,13 +99,14 @@ async function getConnected(windowId) {
   return { connection, probe };
 }
 
-export async function insertGalleryPhoto(windowId,image){
+export async function insertGalleryPhoto(windowId,image,dropNonce, sender){
   if(activeTransfers.has(windowId)) throw Error('자동 전송이 끝난 뒤 삽입해 주세요.');
   activeTransfers.add(windowId);
   try {
     const {connection}=await getConnected(windowId);
-    if(connection.platform!=='naver') throw Error('네이버 블로그 글쓰기 탭을 연결해 주세요.');
-    const result=await invoke(connection,'manualPhoto',{image:{name:image.name,data:await getData(image.id)}});
+    if (sender && (sender.tab?.id!==connection.tabId || sender.documentId!==connection.documentId
+      || sender.frameId!==connection.frameId)) throw Error('연결된 본문에 이미지를 놓아주세요.');
+    const result=await invoke(connection,'manualPhoto',{dropNonce,image:{name:image.name,data:await getData(image.id)}});
     if(result.status!=='ok') throw Error(result.message || '편집기에서 사진을 확인해 주세요.');
   } finally {activeTransfers.delete(windowId);}
 }
@@ -157,7 +157,7 @@ export function buildTransferPlan(draft, form, photos, platform) {
   const blocks = sourceBlocks.filter(block => !divider(block));
   const naver = platform === 'naver';
   const tagCandidates = [...(draft.hashtags || []), ...(form.useArticleReference ? '' : form.keywords || '').split(/[,\n]+/)];
-  const tags = naver ? [...new Set(tagCandidates.map(tag =>
+  const tags = naver || platform==='tistory' ? [...new Set(tagCandidates.map(tag =>
     tag.normalize('NFC').replace(/[^\p{L}\p{N}_]/gu, '')).filter(Boolean))].slice(0, 8) : [];
   const tagLine = tags.map(tag => '#' + tag).join(' ');
   const tagBlock = tagLine ? { type: 'paragraph', text: tagLine } : null;

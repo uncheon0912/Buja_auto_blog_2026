@@ -1,10 +1,13 @@
 import {layoutArticle,reviewArticle,seriesNames,seriesDirection,VERSION,busy,text,formOf,draftOf,parseDraft,articlePrompt,imagePrompt,imageOverlayText,thumbnailOverlayText,imageSeriesStyle,planImageBatch,backupOf,validateImage,validRepo,newer} from './2026-11-18-core.mjs';
-import {putAsset,getData} from './2026-11-18-assets.mjs';
+import {putAsset,getData,deleteAssets} from './2026-11-18-assets.mjs';
 import {insertGalleryPhoto,clearDraftTransfers,connectionFor, recoverTransfer, connectEditor, disconnectEditor, focusConnected, invalidateEditor, sendDraft} from './2026-11-18-transfer.mjs';
 const defaults={remainingImages:null,form:formOf(),draft:draftOf(),images:[],reference:null,history:[],logs:[],job:null,imageQueue:[],aiTabId:null,settings:{repo:''},onboarded:false};
 const read=async()=>({...defaults,...await chrome.storage.local.get(Object.keys(defaults))});
 const now=()=>new Date().toISOString();
 const change=values=>chrome.storage.local.set(values);
+const galleryDrags=new Map();
+const assetIds=work=>[...(work.images||[]).map(image=>image.id), work.reference?.id,
+ work.job?.replacement?.id, work.job?.output?.imageId].filter(Boolean);
 const placementOf = value => ['auto','fixed'].includes(value) ? {placement:value} : {};
 async function log(event,detail='',diagnostic){
  const {logs=[]}=await chrome.storage.local.get('logs');
@@ -324,6 +327,18 @@ async function command(msg,sender){
  }
  if(msg.type==='BUJA_RESULT')return result(msg,sender);
  if(msg.type==='BUJA_STAGE')return reportArticleStage(msg,sender);
+ if(msg.type==='DROP_GALLERY_PHOTO'){
+  const windowId=sender.tab?.windowId;
+  const drag=galleryDrags.get(windowId);
+  if(!drag || drag.expires<Date.now() || drag.nonce!==msg.nonce)throw Error('갤러리에서 사진을 다시 끌어 놓아주세요.');
+  const s=await read();
+  const image=s.images.find(entry=>entry.id===drag.imageId);
+  if(busy(s.job) || !image)throw Error('삽입할 사진이나 진행 중인 작업을 확인해주세요.');
+  await insertGalleryPhoto(windowId,image,msg.nonce,sender);
+  galleryDrags.delete(windowId);
+  await log('사진 끌어놓기 완료',image.name);
+  return {};
+ }
  if(/^THREAD_/.test(msg.type)){
   if(sender.frameId!==0 || !/^https:\/\/(?:www\.)?threads\.(?:com|net)\//.test(sender.url||'') || !sender.tab?.id)throw Error('Threads 탭을 확인해주세요.');
   const threadsTab=sender.tab.id;
@@ -384,6 +399,13 @@ async function command(msg,sender){
   return connection;
  }
  case 'DISCONNECT':await disconnectEditor(msg.windowId);await log('탭 연결 해제');return {};
+ case 'ARM_GALLERY_DRAG':{
+  if(busy(s.job) || !s.images.some(image=>image.id===msg.id) || !/^[0-9a-f-]{36}$/i.test(msg.nonce))return {};
+  const connection=await connectionFor(msg.windowId);
+  if(!connection || connection.invalid)throw Error('이미지를 넣을 현재 탭을 연결해주세요.');
+  galleryDrags.set(msg.windowId,{nonce:msg.nonce,imageId:msg.id,expires:Date.now()+30000});
+  return {};
+ }
  case 'INSERT_GALLERY_PHOTO':{
   const image=s.images.find(item=>item.id===msg.id);
   if(!image)throw Error('갤러리에서 사진을 다시 선택해 주세요.');
@@ -495,6 +517,25 @@ async function command(msg,sender){
   await snapshot('테스트 초안 불러오기 전',s);
   await clearDraftTransfers(s.draft.id,msg.windowId);
   await change({draft,images:[image],reference:null,job:null,remainingImages:null,imageQueue:[]});
+  return {};
+ }
+ case 'RESET_CURRENT_POST':{
+  if(busy(s.job) || msg.draftId!==s.draft.id)throw Error('현재 초안과 진행 중인 작업을 다시 확인해주세요.');
+  await clearDraftTransfers(s.draft.id,msg.windowId);
+  const keep=new Set(s.history.flatMap(assetIds));
+  if(s.reference)keep.add(s.reference.id);
+  if(s.job?.output?.imageId)keep.add(s.job.output.imageId);
+  await change({draft:draftOf(),images:[],job:null,remainingImages:null,imageQueue:[]});
+  galleryDrags.delete(msg.windowId);
+  await deleteAssets([...new Set(assetIds(s).filter(id=>!keep.has(id)))]);
+  return {};
+ }
+ case 'PURGE_HISTORY':{
+  if(busy(s.job))throw Error('진행 중인 작업을 마친 뒤 삭제해주세요.');
+  const keep=new Set(assetIds(s));
+  const obsolete=[...new Set(s.history.flatMap(assetIds).filter(id=>!keep.has(id)))];
+  await change({history:[]});
+  await deleteAssets(obsolete);
   return {};
  }
  case 'CLEAR_DRAFT':{

@@ -4,13 +4,32 @@ import { blocksOf, fixedPhotoPosition, imageAnchor, photoPlacements, textOfBlock
 import { connectionKey, transferKey, platformNames } from './2026-11-18-platforms.mjs';
 import './2026-11-18-studio-appearance.mjs';
 const $=id=>document.getElementById(id),keys=Object.keys(formOf()).filter(id=>id!=='chat');
-let state=null,timer,pending=false,transferring=false,saves=Promise.resolve(),urls=[],galleryEpoch=0;
+let state=null,timer,pending=false,transferring=false,saves=Promise.resolve();
 let draftProgress;
 let draftProgressTimer;
 let workingContent = [];
 let editRevision = 0;
 let savedRevision = 0;
 const previews = new Map();
+const galleryObserver = new IntersectionObserver(entries=>{
+ for(const entry of entries){
+  if(!entry.isIntersecting)continue;
+  const image=entry.target;
+  galleryObserver.unobserve(image);
+  const id=image.dataset.previewId;
+  let pendingURL=previews.get(id);
+  if(!pendingURL) {
+   pendingURL=getBlob(id).then(blob=>URL.createObjectURL(blob));
+   previews.set(id,pendingURL);
+  }
+  void pendingURL.then(url=>{
+   if(image.isConnected && previews.get(id)===pendingURL)image.src=url;
+  },()=>{
+   if(previews.get(id)===pendingURL)previews.delete(id);
+   if(image.isConnected)image.alt='원본을 찾지 못했습니다. 사진 파일을 다시 선택해주세요.';
+  });
+ }
+},{root:document.getElementById('gallery'),rootMargin:'120px'});
 const { id: panelWindowId } = await chrome.windows.getCurrent();
 const api=async(type,extra={})=>{const r=await chrome.runtime.sendMessage({type,windowId:panelWindowId,...extra});if(!r?.ok)throw Object.assign(Error(r?.error||'확장 프로그램 연결을 확인해주세요.'),{code:r?.code});return r.data;};
 const notice=(s,error=false)=>{$('notice').hidden=false;$('notice').classList.toggle('error',error);$('notice').textContent=s;};
@@ -175,7 +194,7 @@ function renderDraftProgress() {
   }
 }
 
-function renderJob(){renderDraftProgress();const running=pending||draftProgress?.status==='connecting'||busy(state?.job)||transferring;for(const id of ['generate','revise','generateImages','applyManual','draftTitle','draftBody','summary','hashtags','photoFiles','referenceFile','import','clearImages','clearDraft','loadTestDraft'])$(id).disabled=!!running;for(const e of document.querySelectorAll('#gallery button,#gallery input,#gallery textarea'))e.disabled=!!running;
+function renderJob(){renderDraftProgress();const running=pending||draftProgress?.status==='connecting'||busy(state?.job)||transferring;for(const id of ['generate','revise','generateImages','applyManual','draftTitle','draftBody','summary','hashtags','photoFiles','referenceFile','import','clearImages','clearDraft','loadTestDraft','resetCurrent','purgeHistory'])$(id).disabled=!!running;for(const e of document.querySelectorAll('#gallery button,#gallery input,#gallery textarea'))e.disabled=!!running;
  for(const field of document.querySelectorAll('#blockFields textarea,#gallery select')) field.disabled=running||transferring;
  const imageJob=state?.job?.kind==='image';
  $('stopImages').hidden=!imageJob || !busy(state.job);
@@ -270,12 +289,19 @@ function changedDraft(){editRevision++;sourceView();renderPreview();clearTimeout
 $('preferImagePrompt').addEventListener('input',renderJob);
 for(const id of [...keys,'draftTitle','draftBody','summary','hashtags'])$(id).addEventListener('input',changedDraft);
 async function renderGallery(){
- const epoch=++galleryEpoch;
  const gallery=$('gallery');
  const scrollPosition=gallery.scrollTop;
  const expanded=new Set([...gallery.querySelectorAll('.image-card-details[open]')]
   .map(details=>details.closest('.image-card').dataset.imageId));
- urls.forEach(url=>URL.revokeObjectURL(url));urls=[];previews.clear();gallery.replaceChildren();
+ galleryObserver.disconnect();
+ const available=new Set(state.images.map(image=>image.id));
+ if(state.job?.replacement)available.add(state.job.replacement.id);
+ for(const [id,preview] of previews){
+  if(available.has(id))continue;
+  previews.delete(id);
+  void preview.then(url=>URL.revokeObjectURL(url),()=>{});
+ }
+ gallery.replaceChildren();
  if(!state.images.length){
   const empty=document.createElement('p');empty.className='hint gallery-empty';
   empty.textContent='사진 파일을 추가하거나 AI 이미지를 생성해주세요.';
@@ -291,14 +317,21 @@ async function renderGallery(){
  const isThumbnail = thumbnail?.id === image.id;
  const card=document.createElement('article');card.className='image-card';card.dataset.imageId=image.id;
  const img=document.createElement('img');img.alt=image.alt||image.caption||image.name;img.loading='lazy';img.decoding='async';
- try{
-  const blob=await getBlob(image.id);
-  if(epoch!==galleryEpoch)return;
-  const url=URL.createObjectURL(blob);urls.push(url);previews.set(image.id,url);img.src=url;
- }catch{
-  if(epoch!==galleryEpoch)return;
-  img.alt='원본을 찾지 못했습니다. 사진 파일을 다시 선택해주세요.';
- }
+ img.dataset.previewId=image.id;
+ img.draggable=true;
+ img.title='연결된 글쓰기창의 본문으로 끌어 놓으세요.';
+ img.addEventListener('dragstart',event=>{
+  if(!state.connection || state.connection.invalid || busy(state.job) || !event.dataTransfer){
+   event.preventDefault();
+   notice('먼저 현재 글쓰기 탭을 연결해주세요.',true);
+   return;
+  }
+  const nonce=crypto.randomUUID();
+  event.dataTransfer.clearData();
+  event.dataTransfer.setData('application/x-buja-gallery-photo',nonce);
+  event.dataTransfer.effectAllowed='copy';
+  void act(()=>api('ARM_GALLERY_DRAG',{id:image.id,nonce}));
+ });
  const content=document.createElement('div');content.className='image-card-content';
  const title=document.createElement('strong');title.className='image-card-title';
  title.textContent=image.caption?.trim()||image.alt?.trim()||(image.thumbnail?'블로그 썸네일':image.name);
@@ -377,24 +410,20 @@ async function renderGallery(){
  },quick);
  const replacement = state.job?.item?.replaceId===image.id ? state.job.replacement : null;
  if(replacement){
-  try{
-   const blob=await getBlob(replacement.id);
-   if(epoch!==galleryEpoch)return;
-   const previewURL=URL.createObjectURL(blob);
-   urls.push(previewURL);
    const preview=document.createElement('img');
-   preview.src=previewURL;preview.alt='교체 후보 이미지';
+   preview.alt='교체 후보 이미지';
+   preview.dataset.previewId=replacement.id;
    const controls=document.createElement('div');controls.className='row';
    button('새 이미지로 교체',async()=>{await api('APPLY_IMAGE_REPLACEMENT',{id:image.id});await sync();},controls);
    button('원본 유지',async()=>{await api('DISCARD_IMAGE_REPLACEMENT',{id:image.id});await sync();},controls);
    content.append(preview,controls);
-  }catch{notice('교체 후보 이미지를 미리 볼 수 없습니다.',true);}
  }
  if(image.draftId!==state.draft.id)button('현재 초안에 사용',()=>save(true));
  const remove=button('제거',async()=>{if(!confirm('갤러리에서 제거할까요? History에서 원본을 복원할 수 있습니다.'))return;await api('REMOVE_IMAGE',{id:image.id});await sync();});
  remove.className='danger';details.append(row);content.append(quick,details);card.append(img,content);gallery.append(card);
+ for(const preview of card.querySelectorAll('img[data-preview-id]'))galleryObserver.observe(preview);
  }
- if(epoch===galleryEpoch){gallery.scrollTop=scrollPosition;renderJob();renderPreview();}
+ gallery.scrollTop=scrollPosition;renderJob();renderPreview();
 }
 async function upload(file,reference=false,replaceId=null){if(!file)return;if(file.size>8*1024*1024)throw Error('장당 8MB 이하 사진을 선택해주세요.');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(Error('파일 읽기 실패'));r.readAsDataURL(file);});await api('ADD_IMAGE',{data,name:file.name,reference,replaceId});await sync();notice(reference?'참고 사진을 저장했습니다.':'사진을 갤러리에 추가했습니다. 설명과 문단 위치를 설정해주세요.');}
 $('photoFiles').addEventListener('change',()=>act(async()=>{await flush();for(const file of $('photoFiles').files)await upload(file);$('photoFiles').value='';}));
@@ -452,6 +481,28 @@ click('recoverComposer',async()=>{
 });
 click('stopImages',async()=>{await api('CANCEL');await sync();});
 click('resumeImages',async()=>{await flush();await api('RESUME_IMAGES');await sync();});
+function confirmPostCleanup(heading,message){
+ const dialog=$('postCleanupDialog');
+ $('postCleanupHeading').textContent=heading;
+ $('postCleanupMessage').textContent=message;
+ dialog.returnValue='cancel';
+ dialog.showModal();
+ return new Promise(resolve=>dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true}));
+}
+click('resetCurrent',async()=>{
+ const draftId=state.draft.id;
+ if(!await confirmPostCleanup('현재 포스팅 초기화','저장된 이전 포스팅이 완전히 지워집니다. 현재 초안과 갤러리 사진을 지웁니다.'))return;
+ await flush();
+ await api('RESET_CURRENT_POST',{draftId});
+ await sync(true);
+ notice('현재 초안과 갤러리 사진을 초기화했습니다.');
+});
+click('purgeHistory',async()=>{
+ if(!await confirmPostCleanup('히스토리 완전삭제','History에 보관한 이전 작업과 사진이 완전히 지워집니다. 삭제 후에는 복원할 수 없습니다.'))return;
+ await api('PURGE_HISTORY');
+ await sync();
+ notice('History에 보관한 작업을 완전히 삭제했습니다.');
+});
 click('loadTestDraft',async()=>{
  if(pending || transferring || busy(state?.job) || state?.transfer?.status==='running')return;
  const saved=flush();
@@ -601,5 +652,5 @@ chrome.storage.onChanged.addListener((changes,area)=>{
     if (job.code === 'DRAFT_RESPONSE') showDraftError(job.error,job.code);
   }
 });
-window.addEventListener('pagehide',()=>{clearTimeout(timer);clearInterval(draftProgressTimer);if(editRevision!==savedRevision)void persist().catch(()=>{});urls.forEach(x=>URL.revokeObjectURL(x));});
+window.addEventListener('pagehide',()=>{clearTimeout(timer);clearInterval(draftProgressTimer);if(editRevision!==savedRevision)void persist().catch(()=>{});galleryObserver.disconnect();for(const pendingURL of previews.values())void pendingURL.then(url=>URL.revokeObjectURL(url),()=>{});previews.clear();});
 await act(async()=>{await api('RESTORE_PREFS');await sync(true);if(!state.onboarded)$('helpDialog').showModal();});

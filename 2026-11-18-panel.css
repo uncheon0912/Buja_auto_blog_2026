@@ -413,3 +413,9 @@ button:focus-visible,.stylePicker label:focus-within{outline:3px solid #48ab92;o
   }
 }
 .stylePicker label:has(:disabled){background:transparent;color:inherit;opacity:.48;cursor:default}
+
+.workflow:has(#resetCurrent){grid-template-columns:repeat(5,minmax(0,1fr))}
+#resetCurrent:enabled{background:#ff365e;color:#250711;border-color:#ff6482;box-shadow:0 0 9px #ff365e56}
+#resetCurrent:enabled:hover{background:#ff6888}
+#purgeHistory{margin-top:10px}
+.image-card img[draggable="true"]{cursor:grab}
